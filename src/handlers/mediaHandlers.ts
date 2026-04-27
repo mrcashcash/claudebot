@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Config } from "../config.ts";
 import type { AskClaudeAttachment } from "../services/claude.ts";
 import * as sessions from "../state/sessions.ts";
-import { transcribeAudio } from "../services/voice.ts";
+import { transcribeAudio } from "../services/voice/index.ts";
 import { effectiveWorkspace } from "./commands.ts";
 
 const IMAGE_MEDIA_TYPES = new Set([
@@ -195,8 +195,8 @@ export function registerMediaHandlers(
         const transcribeMs = Date.now() - tTranscribe;
         console.log(
           `[${audio.kind}] chat=${chatId} dur=${audio.durationSec}s ` +
-            `download=${downloadMs}ms decode=${timings.decodeMs}ms ` +
-            `pipeline=${timings.pipelineCached ? "cached" : "first-load"}(${timings.pipelineMs}ms) ` +
+            `backend=${timings.backend} download=${downloadMs}ms ` +
+            `decode=${timings.decodeMs}ms modelLoad=${timings.modelLoadMs}ms ` +
             `infer=${timings.inferMs}ms transcribe-total=${transcribeMs}ms`,
         );
 

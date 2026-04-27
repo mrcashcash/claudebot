@@ -1,67 +1,19 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 
-import type { WhisperModel } from "../config.ts";
+import type { WhisperModel } from "../../config.ts";
 
-export interface TranscribeOptions {
-  /** Absolute path to the source audio (Telegram voice = .ogg/Opus). */
+export interface HFTranscribeOptions {
   inputPath: string;
-  /** Whisper model id (one of WhisperModel). */
   model: WhisperModel;
-  /** ISO 639-1 hint, or undefined for auto-detect. */
   language?: string;
-  /** Override path to ffmpeg. Defaults to bundled ffmpeg-static. */
-  ffmpegPath?: string;
+  ffmpegPath: string;
 }
 
-export interface TranscribeTimings {
-  /** ffmpeg decode of input file → 16 kHz mono Float32. */
-  decodeMs: number;
-  /**
-   * Time spent inside getPipeline(): if `pipelineCached` is false this is
-   * the cold-start cost (HuggingFace download + ONNX runtime init + weight
-   * load). If true, this is just the time to await an already-resolved
-   * promise — typically <5ms — unless the entry exists but the promise is
-   * still pending (e.g. preload in flight), in which case this is the
-   * remaining wait.
-   */
-  pipelineMs: number;
-  /** True if `pipelineCache` already had an entry for this model id. */
-  pipelineCached: boolean;
-  /** transformers.js ASR pipeline call (excluding pipeline load). */
-  inferMs: number;
-}
-
-export interface TranscribeResult {
+export interface HFTranscribeResult {
   text: string;
-  timings: TranscribeTimings;
-}
-
-let cachedFfmpegPath: string | null | undefined = undefined;
-
-async function resolveFfmpegPath(override?: string): Promise<string> {
-  if (override && override.trim() !== "") {
-    if (!existsSync(override)) {
-      throw new Error(
-        `FFMPEG_PATH points at a file that does not exist: ${override}`,
-      );
-    }
-    return override;
-  }
-  if (cachedFfmpegPath === undefined) {
-    const mod = (await import("ffmpeg-static")) as {
-      default: string | null;
-    };
-    cachedFfmpegPath = mod.default;
-  }
-  if (cachedFfmpegPath === null || !existsSync(cachedFfmpegPath)) {
-    throw new Error(
-      "ffmpeg-static binary not found. The platform-specific optional " +
-        "dependency may have failed to install. Either re-run `npm install` " +
-        "with network access, or set FFMPEG_PATH to a system ffmpeg.",
-    );
-  }
-  return cachedFfmpegPath;
+  decodeMs: number;
+  modelLoadMs: number;
+  inferMs: number;
 }
 
 /**
@@ -194,23 +146,18 @@ async function getPipeline(modelId: string): Promise<AsrPipeline> {
   return promise;
 }
 
-export async function transcribeAudio(
-  opts: TranscribeOptions,
-): Promise<TranscribeResult> {
-  const ffmpegPath = await resolveFfmpegPath(opts.ffmpegPath);
-
+export async function transcribeHF(
+  opts: HFTranscribeOptions,
+): Promise<HFTranscribeResult> {
   const tDecode = Date.now();
-  const audio = await decodeToFloat32(ffmpegPath, opts.inputPath);
+  const audio = await decodeToFloat32(opts.ffmpegPath, opts.inputPath);
   const decodeMs = Date.now() - tDecode;
 
-  // Snapshot cache state BEFORE getPipeline mutates it, so we can tell
-  // whether this call paid the cold-start cost or rode an existing entry.
   const modelId = toHuggingFaceModelId(opts.model);
-  const pipelineCached = pipelineCache?.id === modelId;
 
   const tPipe = Date.now();
   const transcriber = await getPipeline(modelId);
-  const pipelineMs = Date.now() - tPipe;
+  const modelLoadMs = Date.now() - tPipe;
 
   // .en models only know English — they reject `language` / `task` flags.
   // Multilingual models accept them and benefit from the language hint.
@@ -230,16 +177,13 @@ export async function transcribeAudio(
   const result = await transcriber(audio, inferenceOpts);
   const inferMs = Date.now() - tInfer;
   const text = (result.text ?? "").trim();
-  return {
-    text,
-    timings: { decodeMs, pipelineMs, pipelineCached, inferMs },
-  };
+  return { text, decodeMs, modelLoadMs, inferMs };
 }
 
 /**
  * Pre-warm the transformers.js whisper pipeline. First call downloads ONNX
  * weights into the HuggingFace cache; subsequent calls are no-ops.
  */
-export async function ensureWhisperModel(model: WhisperModel): Promise<void> {
+export async function ensureHF(model: WhisperModel): Promise<void> {
   await getPipeline(toHuggingFaceModelId(model));
 }

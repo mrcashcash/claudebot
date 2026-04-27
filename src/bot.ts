@@ -11,7 +11,7 @@ import * as approvals from "./handlers/approvals.ts";
 import * as questions from "./handlers/questions.ts";
 import * as restartMarker from "./state/restart-marker.ts";
 import * as busy from "./lifecycle/busy.ts";
-import { ensureWhisperModel } from "./services/voice.ts";
+import { ensureWhisperModel } from "./services/voice/index.ts";
 import {
   registerCommands,
   effectiveWorkspace,
@@ -90,9 +90,9 @@ export function buildBot(config: Config): BuiltBot {
 
   if (config.voice.enabled && config.voice.preloadModel) {
     void ensureWhisperModel(config.voice.whisperModel)
-      .then(() =>
+      .then((backend) =>
         console.log(
-          `[voice] preloaded whisper model: ${config.voice.whisperModel}`,
+          `[voice] backend=${backend} preloaded model=${config.voice.whisperModel}`,
         ),
       )
       .catch((err) => console.error("[voice] preload failed:", err));
