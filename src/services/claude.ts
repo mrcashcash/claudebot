@@ -7,8 +7,8 @@ import {
   type AsyncHookJSONOutput,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { PermissionMode } from "./config.ts";
-import * as turnLog from "./turnLog.ts";
+import type { PermissionMode } from "../config.ts";
+import * as turnLog from "../state/turnLog.ts";
 
 export interface ClaudeReply {
   text: string;

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
-import type { WhisperModel } from "./config.ts";
+import type { WhisperModel } from "../config.ts";
 
 export interface TranscribeOptions {
   /** Absolute path to the source audio (Telegram voice = .ogg/Opus). */

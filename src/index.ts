@@ -2,10 +2,10 @@ import "dotenv/config";
 import fs from "node:fs/promises";
 import { loadConfig } from "./config.ts";
 import { buildBot, COMMAND_MENU } from "./bot.ts";
-import * as sessions from "./sessions.ts";
-import * as restartMarker from "./restart-marker.ts";
-import * as busy from "./busy.ts";
-import * as keepalive from "./keepalive.ts";
+import * as sessions from "./state/sessions.ts";
+import * as restartMarker from "./state/restart-marker.ts";
+import * as busy from "./lifecycle/busy.ts";
+import * as keepalive from "./lifecycle/keepalive.ts";
 
 async function main(): Promise<void> {
   const config = loadConfig();

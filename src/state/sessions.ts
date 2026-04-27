@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PermissionMode } from "./config.ts";
+import type { PermissionMode } from "../config.ts";
 
 export interface ChatState {
   sessionId?: string;
