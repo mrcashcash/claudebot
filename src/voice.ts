@@ -1,25 +1,40 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import fs from "node:fs/promises";
-import path from "node:path";
 
 import type { WhisperModel } from "./config.ts";
 
 export interface TranscribeOptions {
   /** Absolute path to the source audio (Telegram voice = .ogg/Opus). */
   inputPath: string;
-  /** Whisper model id (must match nodejs-whisper's MODEL_OBJECT keys). */
+  /** Whisper model id (one of WhisperModel). */
   model: WhisperModel;
   /** ISO 639-1 hint, or undefined for auto-detect. */
   language?: string;
-  /** Directory for the transient .wav file. */
-  workDir: string;
   /** Override path to ffmpeg. Defaults to bundled ffmpeg-static. */
   ffmpegPath?: string;
 }
 
+export interface TranscribeTimings {
+  /** ffmpeg decode of input file → 16 kHz mono Float32. */
+  decodeMs: number;
+  /**
+   * Time spent inside getPipeline(): if `pipelineCached` is false this is
+   * the cold-start cost (HuggingFace download + ONNX runtime init + weight
+   * load). If true, this is just the time to await an already-resolved
+   * promise — typically <5ms — unless the entry exists but the promise is
+   * still pending (e.g. preload in flight), in which case this is the
+   * remaining wait.
+   */
+  pipelineMs: number;
+  /** True if `pipelineCache` already had an entry for this model id. */
+  pipelineCached: boolean;
+  /** transformers.js ASR pipeline call (excluding pipeline load). */
+  inferMs: number;
+}
+
 export interface TranscribeResult {
   text: string;
+  timings: TranscribeTimings;
 }
 
 let cachedFfmpegPath: string | null | undefined = undefined;
@@ -50,76 +65,133 @@ async function resolveFfmpegPath(override?: string): Promise<string> {
 }
 
 /**
- * Convert any audio file to 16 kHz mono signed 16-bit PCM WAV via ffmpeg.
- * whisper.cpp requires this exact format.
+ * Decode any audio file via ffmpeg directly into a 16 kHz mono Float32Array —
+ * the exact format @huggingface/transformers' ASR pipeline expects. We pipe
+ * raw f32le samples on stdout instead of writing a temp WAV.
  */
-async function convertToWhisperWav(
+async function decodeToFloat32(
   ffmpegPath: string,
   inputPath: string,
-  wavPath: string,
-): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
+): Promise<Float32Array> {
+  return await new Promise<Float32Array>((resolve, reject) => {
     const child = spawn(
       ffmpegPath,
       [
         "-hide_banner",
         "-loglevel",
         "error",
-        "-y",
         "-i",
         inputPath,
         "-ar",
         "16000",
         "-ac",
         "1",
-        "-c:a",
-        "pcm_s16le",
-        wavPath,
+        "-f",
+        "f32le",
+        "-",
       ],
-      { stdio: ["ignore", "ignore", "pipe"], windowsHide: true },
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
     );
+    const chunks: Buffer[] = [];
+    let total = 0;
+    child.stdout.on("data", (c: Buffer) => {
+      chunks.push(c);
+      total += c.length;
+    });
     let stderr = "";
     child.stderr.on("data", (b: Buffer) => {
       stderr += b.toString("utf8");
     });
     child.on("error", (err) => reject(err));
     child.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
+      if (code !== 0) {
         reject(
           new Error(
             `ffmpeg exited with code ${code ?? "?"}: ${stderr.trim() || "(no stderr)"}`,
           ),
         );
+        return;
       }
+      // Concat into a fresh, 4-byte-aligned ArrayBuffer so Float32Array can
+      // view it directly (Buffer.concat's underlying ArrayBuffer is not
+      // guaranteed to be aligned).
+      const ab = new ArrayBuffer(total);
+      const u8 = new Uint8Array(ab);
+      let offset = 0;
+      for (const c of chunks) {
+        u8.set(c, offset);
+        offset += c.length;
+      }
+      resolve(new Float32Array(ab));
     });
   });
 }
 
 /**
- * whisper-cli's stdout looks like:
- *   [00:00:00.000 --> 00:00:03.420]   Hello world.
- *   [00:00:03.420 --> 00:00:05.000]   How are you?
- * plus assorted system/info lines. Strip the timestamps and discard noise.
+ * Map our short Whisper model names to HuggingFace model IDs that publish
+ * ONNX weights compatible with @huggingface/transformers.
+ *
+ * Xenova hosts ONNX exports at huggingface.co/Xenova/whisper-* for the
+ * standard sizes; the v3-class models live under onnx-community.
+ *
+ * `large-v1` has no ONNX export — we fall back to `large-v3`, which is the
+ * current best "large" available in the JS runtime.
  */
-function cleanWhisperStdout(stdout: string): string {
-  const out: string[] = [];
-  for (const raw of stdout.split(/\r?\n/)) {
-    const m = raw.match(
-      /^\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]\s*(.*)$/,
-    );
-    if (m && typeof m[1] === "string") {
-      const text = m[1].trim();
-      if (text.length > 0) out.push(text);
-    }
+function toHuggingFaceModelId(model: WhisperModel): string {
+  switch (model) {
+    case "tiny":
+      return "Xenova/whisper-tiny";
+    case "tiny.en":
+      return "Xenova/whisper-tiny.en";
+    case "base":
+      return "Xenova/whisper-base";
+    case "base.en":
+      return "Xenova/whisper-base.en";
+    case "small":
+      return "Xenova/whisper-small";
+    case "small.en":
+      return "Xenova/whisper-small.en";
+    case "medium":
+      return "Xenova/whisper-medium";
+    case "medium.en":
+      return "Xenova/whisper-medium.en";
+    case "large-v1":
+    case "large":
+      return "onnx-community/whisper-large-v3";
+    case "large-v3-turbo":
+      return "onnx-community/whisper-large-v3-turbo";
   }
-  return out
-    .join(" ")
-    .replace(/\[BLANK_AUDIO\]/gi, "")
-    .replace(/\[SOUND\]/gi, "")
-    .replace(/\s+/g, " ")
-    .trim();
+}
+
+function isEnglishOnly(model: WhisperModel): boolean {
+  return model.endsWith(".en");
+}
+
+type AsrPipeline = (
+  audio: Float32Array,
+  options?: Record<string, unknown>,
+) => Promise<{ text?: string }>;
+
+let pipelineCache: { id: string; promise: Promise<AsrPipeline> } | null = null;
+
+async function getPipeline(modelId: string): Promise<AsrPipeline> {
+  if (pipelineCache && pipelineCache.id === modelId) {
+    return pipelineCache.promise;
+  }
+  const promise = (async () => {
+    const { pipeline } = await import("@huggingface/transformers");
+    const p = await pipeline("automatic-speech-recognition", modelId);
+    return p as unknown as AsrPipeline;
+  })();
+  pipelineCache = { id: modelId, promise };
+  // Drop the cache on failure so the next call retries the load instead of
+  // returning the rejected promise forever.
+  promise.catch(() => {
+    if (pipelineCache && pipelineCache.id === modelId) {
+      pipelineCache = null;
+    }
+  });
+  return promise;
 }
 
 export async function transcribeAudio(
@@ -127,70 +199,47 @@ export async function transcribeAudio(
 ): Promise<TranscribeResult> {
   const ffmpegPath = await resolveFfmpegPath(opts.ffmpegPath);
 
-  await fs.mkdir(opts.workDir, { recursive: true });
-  const baseName =
-    path.basename(opts.inputPath, path.extname(opts.inputPath)) || "audio";
-  const wavPath = path.join(opts.workDir, `${baseName}.${Date.now()}.wav`);
+  const tDecode = Date.now();
+  const audio = await decodeToFloat32(ffmpegPath, opts.inputPath);
+  const decodeMs = Date.now() - tDecode;
 
-  try {
-    await convertToWhisperWav(ffmpegPath, opts.inputPath, wavPath);
+  // Snapshot cache state BEFORE getPipeline mutates it, so we can tell
+  // whether this call paid the cold-start cost or rode an existing entry.
+  const modelId = toHuggingFaceModelId(opts.model);
+  const pipelineCached = pipelineCache?.id === modelId;
 
-    // Lazy-load nodejs-whisper so the cold start doesn't pay for it on
-    // chats that never send voice.
-    const { nodewhisper } = await import("nodejs-whisper");
+  const tPipe = Date.now();
+  const transcriber = await getPipeline(modelId);
+  const pipelineMs = Date.now() - tPipe;
 
-    const stdout = await nodewhisper(wavPath, {
-      modelName: opts.model,
-      autoDownloadModelName: opts.model,
-      // We own cleanup. nodejs-whisper's flag uses sync fs.unlinkSync which
-      // would race with our finally block; keep ownership here for clarity.
-      removeWavFileAfterTranscription: false,
-      whisperOptions: {
-        language: opts.language ?? "auto",
-        translateToEnglish: false,
-        // Don't ask for any side-output files — we only want stdout.
-        outputInText: false,
-        outputInJson: false,
-        outputInSrt: false,
-        outputInVtt: false,
-        outputInCsv: false,
-        outputInLrc: false,
-        outputInWords: false,
-        outputInJsonFull: false,
-      },
-    });
-
-    return { text: cleanWhisperStdout(stdout) };
-  } finally {
-    // Best-effort cleanup of the transient WAV. Ignore ENOENT.
-    try {
-      await fs.unlink(wavPath);
-    } catch {
-      /* ignore */
+  // .en models only know English — they reject `language` / `task` flags.
+  // Multilingual models accept them and benefit from the language hint.
+  const inferenceOpts: Record<string, unknown> = {
+    chunk_length_s: 30,
+    stride_length_s: 5,
+    return_timestamps: false,
+  };
+  if (!isEnglishOnly(opts.model)) {
+    inferenceOpts.task = "transcribe";
+    if (opts.language) {
+      inferenceOpts.language = opts.language;
     }
   }
+
+  const tInfer = Date.now();
+  const result = await transcriber(audio, inferenceOpts);
+  const inferMs = Date.now() - tInfer;
+  const text = (result.text ?? "").trim();
+  return {
+    text,
+    timings: { decodeMs, pipelineMs, pipelineCached, inferMs },
+  };
 }
 
 /**
- * Pre-download the requested whisper.cpp model so the first user message
- * doesn't pay the download wait. Safe to call repeatedly — the underlying
- * helper short-circuits if the model file already exists.
+ * Pre-warm the transformers.js whisper pipeline. First call downloads ONNX
+ * weights into the HuggingFace cache; subsequent calls are no-ops.
  */
 export async function ensureWhisperModel(model: WhisperModel): Promise<void> {
-  // nodejs-whisper doesn't expose autoDownloadModel from its package root,
-  // so we reach into the dist path. The CJS-via-ESM interop wraps the
-  // default export an extra level — handle both shapes defensively so a
-  // future package change doesn't break us silently.
-  type AutoDownloadFn = (
-    logger?: Console,
-    autoDownloadModelName?: string,
-    withCuda?: boolean,
-    modelRootPath?: string,
-  ) => Promise<string>;
-  const mod = (await import("nodejs-whisper/dist/autoDownloadModel.js")) as {
-    default: AutoDownloadFn | { default: AutoDownloadFn };
-  };
-  const fn: AutoDownloadFn =
-    typeof mod.default === "function" ? mod.default : mod.default.default;
-  await fn(console, model, false, undefined);
+  await getPipeline(toHuggingFaceModelId(model));
 }

@@ -775,10 +775,16 @@ export function buildBot(config: Config): BuiltBot {
     chatId: number,
     prompt: string,
     attachments?: AskClaudeAttachment[],
+    /**
+     * Optional wall-clock anchor (ms since epoch) for upstream latency.
+     * The voice/audio handler passes the moment the message arrived so the
+     * end-of-turn log can report total voice-to-final-reply duration.
+     */
+    traceStart?: number,
   ): void {
     // Fire-and-forget: see the handlerTimeout comment in buildBot. runTurn
     // owns its own error handling; this catch is only a safety net.
-    void runTurn(ctx, chatId, prompt, attachments).catch((err) => {
+    void runTurn(ctx, chatId, prompt, attachments, traceStart).catch((err) => {
       console.error(`[turn] background error chat=${chatId}:`, err);
     });
   }
@@ -788,6 +794,7 @@ export function buildBot(config: Config): BuiltBot {
     chatId: number,
     prompt: string,
     attachments?: AskClaudeAttachment[],
+    traceStart?: number,
   ): Promise<void> {
     if (shuttingDown) {
       await ctx.reply(
@@ -831,6 +838,7 @@ export function buildBot(config: Config): BuiltBot {
     );
 
     try {
+      const tAskStart = Date.now();
       const reply = await askClaude(prompt, {
         resumeSessionId: state.sessionId,
         cwd: effectiveWorkspace(state),
@@ -846,6 +854,7 @@ export function buildBot(config: Config): BuiltBot {
         },
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
       });
+      const claudeMs = Date.now() - tAskStart;
       await sessions.update(chatId, {
         sessionId: reply.sessionId || state.sessionId,
         totalCostUsd: (state.totalCostUsd ?? 0) + reply.costUsd,
@@ -855,9 +864,20 @@ export function buildBot(config: Config): BuiltBot {
         reply.text.length > 0
           ? reply.text
           : "(Claude returned an empty response)";
+      const tReplyStart = Date.now();
       for (const part of chunk(body)) {
         await ctx.reply(part.slice(0, TELEGRAM_MAX_TEXT));
       }
+      const replyMs = Date.now() - tReplyStart;
+      const totalMs = Date.now() - turnStart;
+      const traceTail =
+        traceStart !== undefined
+          ? ` voice-to-end=${Date.now() - traceStart}ms`
+          : "";
+      console.log(
+        `[turn] end chat=${chatId} session=${(reply.sessionId || state.sessionId || "").slice(0, 8) || "new"} ` +
+          `claude=${claudeMs}ms reply=${replyMs}ms total=${totalMs}ms${traceTail}`,
+      );
     } catch (err) {
       if (err instanceof AskClaudeAbortedError || controller.signal.aborted) {
         // Cancellation is intentional; the new turn already replied.
@@ -1016,11 +1036,14 @@ export function buildBot(config: Config): BuiltBot {
 
     void (async () => {
       let placeholderId: number | undefined;
+      const tArrival = Date.now();
       try {
         const placeholder = await ctx.reply("🎤 Transcribing…");
         placeholderId = placeholder.message_id;
 
+        const tDownload = Date.now();
         const buf = await downloadTelegramFile(audio.fileId);
+        const downloadMs = Date.now() - tDownload;
         const ws = effectiveWorkspace(sessions.get(chatId));
         const uploadsDir = path.join(ws, ".uploads");
         await fs.mkdir(uploadsDir, { recursive: true });
@@ -1038,13 +1061,20 @@ export function buildBot(config: Config): BuiltBot {
         const inputPath = path.join(uploadsDir, filename);
         await fs.writeFile(inputPath, buf);
 
-        const { text } = await transcribeAudio({
+        const tTranscribe = Date.now();
+        const { text, timings } = await transcribeAudio({
           inputPath,
           model: config.voice.whisperModel,
           language: config.voice.language,
-          workDir: uploadsDir,
           ffmpegPath: config.voice.ffmpegPath,
         });
+        const transcribeMs = Date.now() - tTranscribe;
+        console.log(
+          `[${audio.kind}] chat=${chatId} dur=${audio.durationSec}s ` +
+            `download=${downloadMs}ms decode=${timings.decodeMs}ms ` +
+            `pipeline=${timings.pipelineCached ? "cached" : "first-load"}(${timings.pipelineMs}ms) ` +
+            `infer=${timings.inferMs}ms transcribe-total=${transcribeMs}ms`,
+        );
 
         // Transcript is fed silently to Claude — drop the placeholder.
         if (placeholderId !== undefined) {
@@ -1065,7 +1095,7 @@ export function buildBot(config: Config): BuiltBot {
         const prompt =
           `[User sent a ${audio.durationSec}s ${audio.kind} message. Transcript:]\n${transcript}` +
           (caption ? `\n\n[Caption: ${caption}]` : "");
-        kickOffTurn(ctx, chatId, prompt);
+        kickOffTurn(ctx, chatId, prompt, undefined, tArrival);
       } catch (err) {
         console.error(`[${audio.kind}] failed:`, err);
         const msg = `❌ Transcription failed: ${err instanceof Error ? err.message : String(err)}`;

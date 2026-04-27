@@ -5,6 +5,7 @@ import { buildBot, COMMAND_MENU } from "./bot.ts";
 import * as sessions from "./sessions.ts";
 import * as restartMarker from "./restart-marker.ts";
 import * as busy from "./busy.ts";
+import * as keepalive from "./keepalive.ts";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -13,6 +14,7 @@ async function main(): Promise<void> {
   // Clear any stale .busy left over from a hard crash so the dev runner
   // doesn't get stuck waiting on a sentinel that no live process owns.
   await busy.reset();
+  keepalive.start();
 
   const authLine =
     config.authMode === "oauth-token"
@@ -59,6 +61,7 @@ async function main(): Promise<void> {
     } catch (err) {
       console.error("[shutdown] error during graceful shutdown:", err);
     } finally {
+      keepalive.stop();
       process.exit(0);
     }
   };
