@@ -6,9 +6,12 @@ import type {
 import * as sessions from "../state/sessions.ts";
 import * as approvals from "./approvals.ts";
 import * as questions from "./questions.ts";
+import type { TurnIO } from "./turnIO.ts";
 
 const TELEGRAM_MAX_TEXT = 4096;
 const PROMPT_MAX = 3500;
+
+export type TriggerSource = "user" | "cron";
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -131,14 +134,30 @@ function isAskUserQuestionInput(
 }
 
 export function buildCanUseTool(
-  ctx: Context,
+  io: TurnIO,
   chatId: number,
   turnSignal: AbortSignal,
+  triggerSource: TriggerSource = "user",
 ): CanUseTool {
   return async (toolName, input, options): Promise<PermissionResult> => {
     const toolUseId = options.toolUseID;
 
+    // Auto-allow our own scheduler tools — they only mutate data/crons.json.
+    // Actual prompts they schedule still go through normal approvals when they
+    // fire, with their own triggerSource=cron in effect.
+    if (toolName.startsWith("mcp__scheduler__")) {
+      return { behavior: "allow", updatedInput: input };
+    }
+
     if (toolName === "AskUserQuestion") {
+      // Cron-fired turns have no human reader to answer questions.
+      if (triggerSource === "cron") {
+        return {
+          behavior: "deny",
+          message:
+            "Cron-fired turns cannot ask the user questions. Phrase the prompt with all the info needed up front, or schedule a different prompt.",
+        };
+      }
       if (!isAskUserQuestionInput(input)) {
         return {
           behavior: "deny",
@@ -148,8 +167,7 @@ export function buildCanUseTool(
       }
       try {
         const answers = await questions.ask(
-          ctx,
-          chatId,
+          io,
           toolUseId,
           input.questions,
           turnSignal,
@@ -187,14 +205,25 @@ export function buildCanUseTool(
       return { behavior: "allow", updatedInput: input };
     }
 
+    // Cron-fired turns must not block waiting for inline-button approval —
+    // there's no one watching at 08:00. Auto-deny anything not pre-approved.
+    if (triggerSource === "cron") {
+      return {
+        behavior: "deny",
+        message:
+          `Cron-fired turn cannot prompt for ${toolName}. Pre-approve it via /rules ` +
+          `(send the prompt interactively first and tap "Always") so the next fire works.`,
+      };
+    }
+
     const text = formatToolPrompt(toolName, input);
     try {
-      await ctx.reply(text, {
+      await io.reply(text, {
         parse_mode: "Markdown",
         ...createPermissionKeyboard(toolUseId),
       });
     } catch {
-      await ctx.reply(
+      await io.reply(
         text.replace(/[*_`]/g, ""),
         createPermissionKeyboard(toolUseId),
       );

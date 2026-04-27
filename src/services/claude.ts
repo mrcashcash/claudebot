@@ -31,10 +31,31 @@ export interface AskClaudeOptions {
   chatId?: number;
   attachments?: AskClaudeAttachment[];
   signal?: AbortSignal;
+  /**
+   * Extra dirs handed to the SDK as `additionalDirectories`. Skills under
+   * `<dir>/.claude/skills/` are auto-loaded from these paths in addition to
+   * the cwd, which is how gateway-only skills stay available even when a
+   * chat has overridden its workspace to somewhere else. Note: this also
+   * grants Claude file-read access to those dirs.
+   */
+  additionalDirectories?: string[];
+  /**
+   * SDK MCP servers to register for this turn. We use this to expose the
+   * scheduler tools (cron_create / cron_list / cron_delete) closed over the
+   * current chatId so Claude can never read or mutate another chat's jobs.
+   * A fresh server instance is built per turn in bot.ts.
+   */
+  mcpServers?: Options["mcpServers"];
   // Called the moment we learn the SDK's session_id (system init message).
   // Lets the caller persist it immediately so an aborted/killed turn can still
   // be resumed from the same Claude session on the next message.
   onSessionId?: (sessionId: string) => void | Promise<void>;
+  /**
+   * Appended to the Claude Code preset system prompt for this turn. Used to
+   * tell Claude about gateway-specific behaviors it can't infer from the
+   * message alone (e.g. when to mirror a reminder into Google Calendar).
+   */
+  appendSystemPrompt?: string;
 }
 
 export class AskClaudeAbortedError extends Error {
@@ -172,6 +193,19 @@ export async function askClaude(
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
+    ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
+    ...(opts.additionalDirectories && opts.additionalDirectories.length > 0
+      ? { additionalDirectories: opts.additionalDirectories }
+      : {}),
+    ...(opts.appendSystemPrompt && opts.appendSystemPrompt.length > 0
+      ? {
+          systemPrompt: {
+            type: "preset" as const,
+            preset: "claude_code" as const,
+            append: opts.appendSystemPrompt,
+          },
+        }
+      : {}),
     ...(hooks ? { hooks } : {}),
   };
 

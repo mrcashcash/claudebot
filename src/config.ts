@@ -33,10 +33,14 @@ export interface VoiceConfig {
 export interface Config {
   telegramBotToken: string;
   allowedUserIds: Set<number>;
-  workspaceDir: string;
-  permissionMode: PermissionMode;
-  authMode: "oauth-token" | "subscription-login";
-  voice: VoiceConfig;
+  /**
+   * Directory the bot's own source lives in (captured from process.cwd() at
+   * boot, before anything has chdir'd). Used as the implicit fallback when a
+   * user's `workspaceDir` is unset, and always added to the SDK's
+   * additionalDirectories so `<gatewayDir>/.claude/skills/` loads even when a
+   * user has overridden their workspace to somewhere else.
+   */
+  gatewayDir: string;
 }
 
 export const VALID_PERMISSION_MODES: ReadonlySet<PermissionMode> = new Set([
@@ -86,92 +90,13 @@ function parseUserIds(raw: string): Set<number> {
   return new Set(ids);
 }
 
-function parsePermissionMode(raw: string | undefined): PermissionMode {
-  const v = (raw?.trim() || "acceptEdits") as PermissionMode;
-  if (!VALID_PERMISSION_MODES.has(v)) {
-    throw new Error(
-      `CLAUDE_PERMISSION_MODE must be one of ${[...VALID_PERMISSION_MODES].join(", ")}`,
-    );
-  }
-  return v;
-}
-
-function parseBool(raw: string | undefined, fallback: boolean): boolean {
-  const v = raw?.trim().toLowerCase();
-  if (v === undefined || v === "") return fallback;
-  if (["1", "true", "yes", "y", "on"].includes(v)) return true;
-  if (["0", "false", "no", "n", "off"].includes(v)) return false;
-  throw new Error(`Expected boolean (true/false), got: ${raw}`);
-}
-
-function parseWhisperModel(raw: string | undefined): WhisperModel {
-  const v = (raw?.trim() || "base.en") as WhisperModel;
-  if (!VALID_WHISPER_MODELS.has(v)) {
-    throw new Error(
-      `WHISPER_MODEL must be one of ${[...VALID_WHISPER_MODELS].join(", ")}`,
-    );
-  }
-  return v;
-}
-
-function parseLanguage(raw: string | undefined): string | undefined {
-  const v = raw?.trim();
-  if (v === undefined || v === "") return undefined;
-  if (v === "auto") return undefined;
-  if (!/^[a-z]{2}$/.test(v)) {
-    throw new Error(
-      `WHISPER_LANGUAGE must be a 2-letter ISO 639-1 code (e.g. en, he, es) or "auto"; got: ${raw}`,
-    );
-  }
-  return v;
-}
-
-function parsePositiveInt(
-  raw: string | undefined,
-  fallback: number,
-  name: string,
-): number {
-  const v = raw?.trim();
-  if (v === undefined || v === "") return fallback;
-  const n = Number(v);
-  if (!Number.isInteger(n) || n <= 0) {
-    throw new Error(`${name} must be a positive integer; got: ${raw}`);
-  }
-  return n;
-}
-
-function loadVoiceConfig(): VoiceConfig {
-  return {
-    enabled: parseBool(process.env.VOICE_ENABLED, true),
-    whisperModel: parseWhisperModel(process.env.WHISPER_MODEL),
-    language: parseLanguage(process.env.WHISPER_LANGUAGE),
-    ffmpegPath: process.env.FFMPEG_PATH?.trim() || undefined,
-    preloadModel: parseBool(process.env.WHISPER_PRELOAD, false),
-    maxDurationSec: parsePositiveInt(
-      process.env.VOICE_MAX_DURATION_SEC,
-      600,
-      "VOICE_MAX_DURATION_SEC",
-    ),
-  };
-}
-
 export function loadConfig(): Config {
   const telegramBotToken = required("TELEGRAM_BOT_TOKEN");
   const allowedUserIds = parseUserIds(required("ALLOWED_TELEGRAM_USER_IDS"));
-  const workspaceDir = path.resolve(
-    process.env.CLAUDE_WORKSPACE_DIR?.trim() || process.cwd(),
-  );
-  const permissionMode = parsePermissionMode(process.env.CLAUDE_PERMISSION_MODE);
-  const authMode: Config["authMode"] = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()
-    ? "oauth-token"
-    : "subscription-login";
-  const voice = loadVoiceConfig();
+  const gatewayDir = path.resolve(process.cwd());
   return {
     telegramBotToken,
     allowedUserIds,
-    workspaceDir,
-    permissionMode,
-    authMode,
-    voice,
+    gatewayDir,
   };
 }

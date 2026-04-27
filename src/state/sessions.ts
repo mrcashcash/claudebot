@@ -5,11 +5,18 @@ import type { PermissionMode } from "../config.ts";
 export interface ChatState {
   sessionId?: string;
   totalCostUsd?: number;
-  model?: string;
-  permissionMode?: PermissionMode;
-  workspaceDir?: string;
   allowAlwaysTools?: string[];
   denyAlwaysTools?: string[];
+  /**
+   * Per-chat override of the user's workspace. Resolved chat → user → gateway
+   * by users.effectiveWorkspace. Set in groups so each group has its own
+   * persistent workspace without bleeding into the user's other chats.
+   */
+  workspaceDir?: string;
+  /** Per-chat override of the user's permission mode. */
+  permissionMode?: PermissionMode;
+  /** Per-chat override of the user's model. Empty/undefined = fall through. */
+  model?: string;
 }
 
 type Store = Record<string, ChatState>;
@@ -60,11 +67,5 @@ export async function update(
   assertLoaded();
   const key = String(chatId);
   cache[key] = { ...(cache[key] ?? {}), ...patch };
-  await persist();
-}
-
-export async function clear(chatId: number | string): Promise<void> {
-  assertLoaded();
-  delete cache[String(chatId)];
   await persist();
 }

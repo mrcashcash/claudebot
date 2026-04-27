@@ -68,9 +68,11 @@ async function convertToWhisperWav(
 }
 
 /**
- * Generate a tiny (~0.1 s) silent WAV via ffmpeg's anullsrc filter. Used by
+ * Generate a short (~0.5 s) silent WAV via ffmpeg's anullsrc filter. Used by
  * the cpp probe to exercise the lazy whisper-cli build without depending on
- * a checked-in binary asset.
+ * a checked-in binary asset. whisper.cpp rejects inputs shorter than 100 ms,
+ * and a 0.1 s request can round down under that threshold on sample
+ * boundaries — keep this comfortably above the limit.
  */
 async function writeSilentWav(
   ffmpegPath: string,
@@ -89,7 +91,7 @@ async function writeSilentWav(
         "-i",
         "anullsrc=r=16000:cl=mono",
         "-t",
-        "0.1",
+        "0.5",
         "-c:a",
         "pcm_s16le",
         wavPath,

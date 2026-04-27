@@ -4,9 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Config } from "../config.ts";
 import type { AskClaudeAttachment } from "../services/claude.ts";
-import * as sessions from "../state/sessions.ts";
+import * as users from "../state/users.ts";
 import { transcribeAudio } from "../services/voice/index.ts";
-import { effectiveWorkspace } from "./commands.ts";
 
 const IMAGE_MEDIA_TYPES = new Set([
   "image/jpeg",
@@ -113,8 +112,9 @@ export function registerMediaHandlers(
         return;
       }
 
-      const state = sessions.get(chatId);
-      const ws = effectiveWorkspace(state, config);
+      const userId = ctx.from?.id;
+      if (userId === undefined) return;
+      const ws = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
       const uploadsDir = path.join(ws, ".uploads");
       await fs.mkdir(uploadsDir, { recursive: true });
       const safeName = sanitizeFilename(doc.file_name ?? `${doc.file_id}.bin`);
@@ -147,13 +147,18 @@ export function registerMediaHandlers(
     audio: IncomingAudio,
     caption: string,
   ): void => {
-    if (!config.voice.enabled) {
-      void ctx.reply("Voice transcription is disabled (VOICE_ENABLED=false).");
+    const userId = ctx.from?.id;
+    if (userId === undefined) return;
+    const voice = users.voiceFor(userId);
+    if (!voice.enabled) {
+      void ctx.reply(
+        "Voice transcription is disabled — set voice.enabled=true in your config.",
+      );
       return;
     }
-    if (audio.durationSec > config.voice.maxDurationSec) {
+    if (audio.durationSec > voice.maxDurationSec) {
       void ctx.reply(
-        `❌ ${audio.kind === "voice" ? "Voice message" : "Audio file"} too long (${audio.durationSec}s > ${config.voice.maxDurationSec}s).`,
+        `❌ ${audio.kind === "voice" ? "Voice message" : "Audio file"} too long (${audio.durationSec}s > ${voice.maxDurationSec}s).`,
       );
       return;
     }
@@ -168,7 +173,7 @@ export function registerMediaHandlers(
         const tDownload = Date.now();
         const buf = await downloadTelegramFile(audio.fileId);
         const downloadMs = Date.now() - tDownload;
-        const ws = effectiveWorkspace(sessions.get(chatId), config);
+        const ws = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
         const uploadsDir = path.join(ws, ".uploads");
         await fs.mkdir(uploadsDir, { recursive: true });
 
@@ -188,9 +193,9 @@ export function registerMediaHandlers(
         const tTranscribe = Date.now();
         const { text, timings } = await transcribeAudio({
           inputPath,
-          model: config.voice.whisperModel,
-          language: config.voice.language,
-          ffmpegPath: config.voice.ffmpegPath,
+          model: voice.whisperModel,
+          language: voice.language,
+          ffmpegPath: voice.ffmpegPath,
         });
         const transcribeMs = Date.now() - tTranscribe;
         console.log(

@@ -7,22 +7,25 @@ import {
   type AskClaudeAttachment,
 } from "./services/claude.ts";
 import * as sessions from "./state/sessions.ts";
+import * as users from "./state/users.ts";
 import * as approvals from "./handlers/approvals.ts";
 import * as questions from "./handlers/questions.ts";
 import * as restartMarker from "./state/restart-marker.ts";
 import * as busy from "./lifecycle/busy.ts";
-import { ensureWhisperModel } from "./services/voice/index.ts";
-import {
-  registerCommands,
-  effectiveWorkspace,
-  effectiveMode,
-} from "./handlers/commands.ts";
+import { registerCommands } from "./handlers/commands.ts";
 import {
   buildCanUseTool,
   handlePermissionCallback,
   safeAnswerCbQuery,
+  type TriggerSource,
 } from "./handlers/toolApprovals.ts";
 import { registerMediaHandlers } from "./handlers/mediaHandlers.ts";
+import { ioFromContext, ioFromTelegram, type TurnIO } from "./handlers/turnIO.ts";
+import {
+  buildSchedulerMcp,
+  buildSchedulerSystemGuidance,
+} from "./scheduler/mcp.ts";
+import { registerCronCommands } from "./handlers/cronCommands.ts";
 
 export { COMMAND_MENU } from "./handlers/commands.ts";
 
@@ -45,12 +48,12 @@ function chunk(text: string): string[] {
   return out;
 }
 
-function startTypingLoop(ctx: Context): () => void {
+function startTypingLoop(io: TurnIO): () => void {
   let stopped = false;
   const tick = async () => {
     if (stopped) return;
     try {
-      await ctx.sendChatAction("typing");
+      await io.sendChatAction("typing");
     } catch {
       // Telegram hiccup; ignore.
     }
@@ -63,8 +66,35 @@ function startTypingLoop(ctx: Context): () => void {
   };
 }
 
+export interface KickOffOptions {
+  attachments?: AskClaudeAttachment[];
+  /** Wall-clock anchor (ms since epoch) for upstream latency tracing. */
+  traceStart?: number;
+  /**
+   * "user" (default) — turn was triggered by an incoming Telegram update.
+   * "cron" — turn was fired by the scheduler; tool calls that aren't in
+   * allowAlwaysTools are auto-denied (no inline buttons fire at 08:00 with
+   * nobody watching).
+   */
+  triggerSource?: TriggerSource;
+  /**
+   * If `false`, ignore the chat's stored sessionId for this turn (fresh
+   * session) and DON'T persist the new sessionId back. Used by cron jobs
+   * with `resume: false` so the recurring fire doesn't pollute the chat's
+   * interactive Claude session.
+   */
+  persistSession?: boolean;
+}
+
 export interface BuiltBot {
   bot: Telegraf;
+  /** Fire a turn from outside a Telegraf handler (e.g., the cron ticker). */
+  kickOffTurnFromCron(
+    chatId: number,
+    userId: number,
+    prompt: string,
+    opts?: KickOffOptions,
+  ): void;
   gracefulShutdown(reason: string): Promise<void>;
 }
 
@@ -88,16 +118,6 @@ export function buildBot(config: Config): BuiltBot {
   let lastActiveChat: number | null = null;
   let shuttingDown = false;
 
-  if (config.voice.enabled && config.voice.preloadModel) {
-    void ensureWhisperModel(config.voice.whisperModel)
-      .then((backend) =>
-        console.log(
-          `[voice] backend=${backend} preloaded model=${config.voice.whisperModel}`,
-        ),
-      )
-      .catch((err) => console.error("[voice] preload failed:", err));
-  }
-
   bot.use(async (ctx, next) => {
     const userId = ctx.from?.id;
     if (userId === undefined || !config.allowedUserIds.has(userId)) {
@@ -106,10 +126,20 @@ export function buildBot(config: Config): BuiltBot {
       );
       return;
     }
+    // First-time authorized user: drop a default app-config file so they have
+    // something to edit (and the watcher picks up further hand-edits).
+    await users.ensure(userId).catch((err) => {
+      console.warn(`[users] ensure(${userId}) failed:`, err);
+    });
     await next();
   });
 
-  registerCommands(bot, { config, bootTime: BOOT_TIME, kickOffTurn });
+  registerCommands(bot, { config, bootTime: BOOT_TIME, kickOffTurn: kickOffTurnFromContext });
+  registerCronCommands(bot);
+
+  function userIdFromCtx(ctx: Context): number | undefined {
+    return ctx.from?.id;
+  }
 
   bot.on(callbackQuery("data"), async (ctx) => {
     const data = ctx.callbackQuery.data;
@@ -139,36 +169,54 @@ export function buildBot(config: Config): BuiltBot {
     await safeAnswerCbQuery(ctx);
   });
 
-  function kickOffTurn(
+  function kickOffTurnFromContext(
     ctx: Context,
     chatId: number,
     prompt: string,
     attachments?: AskClaudeAttachment[],
-    /**
-     * Optional wall-clock anchor (ms since epoch) for upstream latency.
-     * The voice/audio handler passes the moment the message arrived so the
-     * end-of-turn log can report total voice-to-final-reply duration.
-     */
     traceStart?: number,
+  ): void {
+    const userId = userIdFromCtx(ctx);
+    if (userId === undefined) return; // auth middleware already rejected
+    const io = ioFromContext(ctx);
+    kickOffTurn(io, chatId, userId, prompt, {
+      ...(attachments ? { attachments } : {}),
+      ...(traceStart !== undefined ? { traceStart } : {}),
+    });
+  }
+
+  function kickOffTurn(
+    io: TurnIO,
+    chatId: number,
+    userId: number,
+    prompt: string,
+    opts: KickOffOptions = {},
   ): void {
     // Fire-and-forget: see the handlerTimeout comment in buildBot. runTurn
     // owns its own error handling; this catch is only a safety net.
-    void runTurn(ctx, chatId, prompt, attachments, traceStart).catch((err) => {
+    void runTurn(io, chatId, userId, prompt, opts).catch((err) => {
       console.error(`[turn] background error chat=${chatId}:`, err);
     });
   }
 
   async function runTurn(
-    ctx: Context,
+    io: TurnIO,
     chatId: number,
+    userId: number,
     prompt: string,
-    attachments?: AskClaudeAttachment[],
-    traceStart?: number,
+    opts: KickOffOptions,
   ): Promise<void> {
+    const triggerSource: TriggerSource = opts.triggerSource ?? "user";
+    const persistSession = opts.persistSession ?? true;
+
     if (shuttingDown) {
-      await ctx.reply(
-        "🔄 Bot is restarting due to a code change. Try again in a moment.",
-      );
+      try {
+        await io.reply(
+          "🔄 Bot is restarting due to a code change. Try again in a moment.",
+        );
+      } catch {
+        // ignore
+      }
       return;
     }
 
@@ -179,7 +227,7 @@ export function buildBot(config: Config): BuiltBot {
         `[turn] chat=${chatId} cancelling previous turn (superseded)`,
       );
       try {
-        await ctx.reply("⏹️ Previous turn cancelled — starting new one.");
+        await io.reply("⏹️ Previous turn cancelled — starting new one.");
       } catch {
         // ignore
       }
@@ -189,45 +237,112 @@ export function buildBot(config: Config): BuiltBot {
     turnControllers.set(chatId, controller);
 
     const state = sessions.get(chatId);
-    const stopTyping = startTypingLoop(ctx);
-    const canUseTool = buildCanUseTool(ctx, chatId, controller.signal);
+    const stopTyping = startTypingLoop(io);
+    const canUseTool = buildCanUseTool(io, chatId, controller.signal, triggerSource);
     inFlightChats.add(chatId);
     void busy.acquire();
     lastActiveChat = chatId;
 
     const turnStart = Date.now();
     const promptPreview = prompt.slice(0, 80).replace(/\s+/g, " ");
-    const sessionTag = state.sessionId ? state.sessionId.slice(0, 8) : "new";
+    // When persistSession is false (cron fresh-session), force a new SDK session
+    // by not passing resumeSessionId. Otherwise reuse the chat's stored session.
+    const resumeSessionId = persistSession ? state.sessionId : undefined;
+    const sessionTag = resumeSessionId ? resumeSessionId.slice(0, 8) : "new";
     const attachTag =
-      attachments && attachments.length > 0 ? ` +${attachments.length}img` : "";
-    const modelTag = state.model || "default";
-    const modeTag = effectiveMode(state, config);
+      opts.attachments && opts.attachments.length > 0
+        ? ` +${opts.attachments.length}img`
+        : "";
+    const effectiveModel = users.effectiveModel(chatId, userId);
+    const modelTag = effectiveModel || "default";
+    const modeTag = users.effectiveMode(chatId, userId);
+    const triggerTag = triggerSource === "cron" ? " trigger=cron" : "";
     console.log(
-      `[turn] start chat=${chatId} session=${sessionTag} model=${modelTag} mode=${modeTag}${attachTag} prompt="${promptPreview}${prompt.length > 80 ? "…" : ""}"`,
+      `[turn] start chat=${chatId} user=${userId} session=${sessionTag} model=${modelTag} mode=${modeTag}${attachTag}${triggerTag} prompt="${promptPreview}${prompt.length > 80 ? "…" : ""}"`,
     );
 
     try {
       const tAskStart = Date.now();
-      const reply = await askClaude(prompt, {
-        resumeSessionId: state.sessionId,
-        cwd: effectiveWorkspace(state, config),
-        permissionMode: effectiveMode(state, config),
-        model: state.model,
+      const tz = users.tzFor(userId);
+      const schedulerServer = buildSchedulerMcp(chatId, userId, tz);
+      const cwd = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+      // Always expose <gatewayDir>/.claude/skills/ to the turn, even when the
+      // chat has overridden its workspace. The SDK loads .claude/skills/ from
+      // additionalDirectories per the skills docs. Skip when cwd already is
+      // the gateway dir (would be a no-op duplicate).
+      const additionalDirectories =
+        cwd === config.gatewayDir ? undefined : [config.gatewayDir];
+      const baseAsk = {
+        cwd,
+        permissionMode: users.effectiveMode(chatId, userId),
+        ...(effectiveModel ? { model: effectiveModel } : {}),
         canUseTool,
         chatId,
         signal: controller.signal,
+        mcpServers: { scheduler: schedulerServer },
+        appendSystemPrompt: buildSchedulerSystemGuidance(tz, userId, chatId),
+        ...(additionalDirectories ? { additionalDirectories } : {}),
         // Persist the SDK's session_id immediately so an aborted/killed turn
-        // can still be resumed from the same session next time.
-        onSessionId: async (sid) => {
-          await sessions.update(chatId, { sessionId: sid });
+        // can still be resumed from the same session next time — but only
+        // when this turn is allowed to take over the chat's session.
+        onSessionId: async (sid: string) => {
+          if (persistSession) {
+            await sessions.update(chatId, { sessionId: sid });
+          }
         },
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-      });
+        ...(opts.attachments && opts.attachments.length > 0
+          ? { attachments: opts.attachments }
+          : {}),
+      };
+      let reply;
+      try {
+        reply = await askClaude(prompt, {
+          ...(resumeSessionId ? { resumeSessionId } : {}),
+          ...baseAsk,
+        });
+      } catch (err) {
+        // The SDK stores conversation transcripts under the cwd's `.claude/`
+        // dir, so a session created in workspace A can't be resumed when the
+        // user later switches to workspace B. (We hit this when /workspace or
+        // a Claude-driven config edit changes workspaceDir.) Drop the stale
+        // resume id and retry once with a fresh session — same prompt, same
+        // user-visible turn.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+          resumeSessionId &&
+          !controller.signal.aborted &&
+          /No conversation found with session ID/i.test(msg)
+        ) {
+          console.warn(
+            `[turn] chat=${chatId} resume failed (workspace likely changed) — retrying fresh`,
+          );
+          if (persistSession) {
+            await sessions.update(chatId, { sessionId: undefined });
+          }
+          try {
+            await io.reply(
+              "🆕 Starting a fresh Claude session — your previous session lived in a different workspace.",
+            );
+          } catch {
+            // ignore
+          }
+          reply = await askClaude(prompt, baseAsk);
+        } else {
+          throw err;
+        }
+      }
       const claudeMs = Date.now() - tAskStart;
-      await sessions.update(chatId, {
-        sessionId: reply.sessionId || state.sessionId,
-        totalCostUsd: (state.totalCostUsd ?? 0) + reply.costUsd,
-      });
+      if (persistSession) {
+        await sessions.update(chatId, {
+          sessionId: reply.sessionId || state.sessionId,
+          totalCostUsd: (state.totalCostUsd ?? 0) + reply.costUsd,
+        });
+      } else {
+        // Still tally cost — the user is paying for it.
+        await sessions.update(chatId, {
+          totalCostUsd: (state.totalCostUsd ?? 0) + reply.costUsd,
+        });
+      }
 
       const body =
         reply.text.length > 0
@@ -235,16 +350,16 @@ export function buildBot(config: Config): BuiltBot {
           : "(Claude returned an empty response)";
       const tReplyStart = Date.now();
       for (const part of chunk(body)) {
-        await ctx.reply(part.slice(0, TELEGRAM_MAX_TEXT));
+        await io.reply(part.slice(0, TELEGRAM_MAX_TEXT));
       }
       const replyMs = Date.now() - tReplyStart;
       const totalMs = Date.now() - turnStart;
       const traceTail =
-        traceStart !== undefined
-          ? ` voice-to-end=${Date.now() - traceStart}ms`
+        opts.traceStart !== undefined
+          ? ` voice-to-end=${Date.now() - opts.traceStart}ms`
           : "";
       console.log(
-        `[turn] end chat=${chatId} session=${(reply.sessionId || state.sessionId || "").slice(0, 8) || "new"} ` +
+        `[turn] end chat=${chatId} session=${(reply.sessionId || resumeSessionId || "").slice(0, 8) || "new"} ` +
           `claude=${claudeMs}ms reply=${replyMs}ms total=${totalMs}ms${traceTail}`,
       );
     } catch (err) {
@@ -254,7 +369,7 @@ export function buildBot(config: Config): BuiltBot {
       }
       console.error("[claude] error handling message:", err);
       try {
-        await ctx.reply(
+        await io.reply(
           `Error talking to Claude: ${err instanceof Error ? err.message : String(err)}`,
         );
       } catch {
@@ -270,13 +385,26 @@ export function buildBot(config: Config): BuiltBot {
     }
   }
 
-  registerMediaHandlers(bot, { config, kickOffTurn });
+  function kickOffTurnFromCron(
+    chatId: number,
+    userId: number,
+    prompt: string,
+    opts: KickOffOptions = {},
+  ): void {
+    const io = ioFromTelegram(bot.telegram, chatId);
+    kickOffTurn(io, chatId, userId, prompt, {
+      triggerSource: "cron",
+      ...opts,
+    });
+  }
+
+  registerMediaHandlers(bot, { config, kickOffTurn: kickOffTurnFromContext });
 
   bot.on(message("text"), async (ctx) => {
     const chatId = ctx.chat.id;
     const text = ctx.message.text;
     if (text.startsWith("/")) return;
-    kickOffTurn(ctx, chatId, text);
+    kickOffTurnFromContext(ctx, chatId, text);
   });
 
   async function gracefulShutdown(reason: string): Promise<void> {
@@ -352,5 +480,5 @@ export function buildBot(config: Config): BuiltBot {
     }
   }
 
-  return { bot, gracefulShutdown };
+  return { bot, kickOffTurnFromCron, gracefulShutdown };
 }

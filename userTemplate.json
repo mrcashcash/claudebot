@@ -1,0 +1,15 @@
+{
+  "name": "",
+  "notes": "Edit any field — Claude can too. Auto-reloaded on save (next turn picks it up).",
+  "workspaceDir": "",
+  "permissionMode": "acceptEdits",
+  "model": "",
+  "tz": "Asia/Jerusalem",
+  "voice": {
+    "enabled": true,
+    "whisperModel": "base.en",
+    "language": "en",
+    "preloadModel": false,
+    "maxDurationSec": 600
+  }
+}

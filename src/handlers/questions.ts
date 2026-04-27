@@ -1,5 +1,5 @@
-import type { Context } from "telegraf";
 import { Markup } from "telegraf";
+import type { TurnIO } from "./turnIO.ts";
 
 export interface QuestionOption {
   label: string;
@@ -21,7 +21,7 @@ interface ActiveSession {
   currentIndex: number;
   toggled: Set<number>;
   messageId: number | undefined;
-  ctx: Context;
+  io: TurnIO;
   resolve: (answers: Record<string, string>) => void;
   cancelled: boolean;
 }
@@ -78,7 +78,7 @@ async function renderCurrent(s: ActiveSession): Promise<void> {
   const kb = buildKeyboard(s);
   try {
     if (s.messageId !== undefined) {
-      await s.ctx.telegram.editMessageText(
+      await s.io.telegram.editMessageText(
         s.chatId,
         s.messageId,
         undefined,
@@ -86,7 +86,7 @@ async function renderCurrent(s: ActiveSession): Promise<void> {
         { parse_mode: "Markdown", ...kb },
       );
     } else {
-      const sent = await s.ctx.telegram.sendMessage(s.chatId, text, {
+      const sent = await s.io.telegram.sendMessage(s.chatId, text, {
         parse_mode: "Markdown",
         ...kb,
       });
@@ -97,7 +97,7 @@ async function renderCurrent(s: ActiveSession): Promise<void> {
     const plain = text.replace(/[*_`]/g, "");
     if (s.messageId !== undefined) {
       try {
-        await s.ctx.telegram.editMessageText(
+        await s.io.telegram.editMessageText(
           s.chatId,
           s.messageId,
           undefined,
@@ -108,7 +108,7 @@ async function renderCurrent(s: ActiveSession): Promise<void> {
         // ignore
       }
     } else {
-      const sent = await s.ctx.telegram.sendMessage(s.chatId, plain, kb);
+      const sent = await s.io.telegram.sendMessage(s.chatId, plain, kb);
       s.messageId = sent.message_id;
     }
   }
@@ -117,7 +117,7 @@ async function renderCurrent(s: ActiveSession): Promise<void> {
 async function finalizeMessage(s: ActiveSession, summary: string): Promise<void> {
   if (s.messageId === undefined) return;
   try {
-    await s.ctx.telegram.editMessageText(
+    await s.io.telegram.editMessageText(
       s.chatId,
       s.messageId,
       undefined,
@@ -126,7 +126,7 @@ async function finalizeMessage(s: ActiveSession, summary: string): Promise<void>
     );
   } catch {
     try {
-      await s.ctx.telegram.editMessageReplyMarkup(s.chatId, s.messageId, undefined, undefined);
+      await s.io.telegram.editMessageReplyMarkup(s.chatId, s.messageId, undefined, undefined);
     } catch {
       // ignore
     }
@@ -151,8 +151,7 @@ function shortId(): string {
 }
 
 export async function ask(
-  ctx: Context,
-  chatId: number,
+  io: TurnIO,
   _toolUseId: string,
   questions: QuestionDef[],
   signal?: AbortSignal,
@@ -162,13 +161,13 @@ export async function ask(
     while (active.has(requestId)) requestId = shortId();
     const s: ActiveSession = {
       requestId,
-      chatId,
+      chatId: io.chatId,
       questions,
       answers: {},
       currentIndex: 0,
       toggled: new Set(),
       messageId: undefined,
-      ctx,
+      io,
       resolve,
       cancelled: false,
     };
@@ -179,7 +178,7 @@ export async function ask(
       active.delete(requestId);
       s.cancelled = true;
       if (s.messageId !== undefined) {
-        void s.ctx.telegram
+        void s.io.telegram
           .editMessageText(
             s.chatId,
             s.messageId,

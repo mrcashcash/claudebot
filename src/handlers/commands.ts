@@ -4,7 +4,44 @@ import path from "node:path";
 import type { Config, PermissionMode } from "../config.ts";
 import { VALID_PERMISSION_MODES } from "../config.ts";
 import * as sessions from "../state/sessions.ts";
-import type { ChatState } from "../state/sessions.ts";
+import * as users from "../state/users.ts";
+
+type OverrideField = "workspaceDir" | "permissionMode" | "model";
+type OverridePatch = Partial<Pick<sessions.ChatState, OverrideField>>;
+
+/**
+ * In a group/supergroup the per-chat override layer applies; in a DM (where
+ * `chat.id === user.id`) we write to the user layer so the user's "personal
+ * default" stays meaningful. Detect via chat.type so the caller doesn't need
+ * to know the id-equality trick.
+ */
+function isGroupChat(ctx: Context): boolean {
+  return ctx.chat !== undefined && ctx.chat.type !== "private";
+}
+
+/**
+ * Apply a workspace/mode/model patch to the right scope: chat-layer
+ * (sessions.json) in groups, user-layer (data/users/<id>.json) in DMs.
+ * Returns the scope that was written, or null if context lacks ids.
+ */
+async function writeOverride(
+  ctx: Context,
+  patch: OverridePatch,
+): Promise<"chat" | "user" | null> {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (chatId === undefined || userId === undefined) return null;
+  if (isGroupChat(ctx)) {
+    await sessions.update(chatId, patch);
+    return "chat";
+  }
+  await users.update(userId, patch);
+  return "user";
+}
+
+function scopeNote(scope: "chat" | "user"): string {
+  return scope === "chat" ? "for this chat" : "as your default";
+}
 
 export const MODEL_ALIASES: Record<string, string> = {
   opus: "claude-opus-4-7",
@@ -58,25 +95,20 @@ export const COMMAND_MENU = [
     description: "Summarize and continue from a compact form",
   },
   { command: "resume", description: "Resume a specific session id" },
-  { command: "clear", description: "Clear this chat's memory" },
-  { command: "reset", description: "Alias for /clear" },
-  { command: "new", description: "Alias for /clear" },
+  {
+    command: "new",
+    description: "Start a fresh Claude session (keeps tool rules)",
+  },
   { command: "cost", description: "Show cumulative cost for this chat" },
   {
     command: "rules",
     description: "List always-allow / always-deny tool rules",
   },
+  {
+    command: "cron",
+    description: "List / pause / resume / delete scheduled crons",
+  },
 ] as const;
-
-export const effectiveWorkspace = (
-  state: ChatState,
-  config: Config,
-): string => state.workspaceDir ?? config.workspaceDir;
-
-export const effectiveMode = (
-  state: ChatState,
-  config: Config,
-): PermissionMode => state.permissionMode ?? config.permissionMode;
 
 export interface CommandDeps {
   config: Config;
@@ -89,9 +121,8 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
 
   const helpText =
     "*Telegram → Claude Code gateway*\n" +
-    "Send any text and Claude works in `" +
-    config.workspaceDir +
-    "` by default.\n" +
+    "Send any text and Claude works in your configured workspace " +
+    "(set in `data/users/<your-id>.json`, default is the gateway dir).\n" +
     "You can also send *photos* (Claude sees them), *documents* (saved to `.uploads/` for Claude to read), " +
     "and *voice messages* (transcribed locally with Whisper, no cloud).\n" +
     "When Claude wants to run a tool you'll see Allow / Always / Deny / Never buttons.\n\n" +
@@ -110,13 +141,14 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
   bot.help(sendHelp);
   bot.command("help", sendHelp);
 
-  const handleClear = async (ctx: Context): Promise<void> => {
-    if (ctx.chat) await sessions.clear(ctx.chat.id);
-    await ctx.reply("🧹 Memory cleared. Next message starts a fresh session.");
-  };
-  bot.command("clear", handleClear);
-  bot.command("reset", handleClear);
-  bot.command("new", handleClear);
+  bot.command("new", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    await sessions.update(chatId, { sessionId: undefined });
+    await ctx.reply(
+      "🆕 Session cleared. Next message starts a fresh Claude session (tool rules preserved).",
+    );
+  });
 
   bot.command("cost", async (ctx) => {
     const chatId = ctx.chat?.id;
@@ -128,54 +160,72 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
 
   bot.command("status", async (ctx) => {
     const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const userId = ctx.from?.id;
+    if (chatId === undefined || userId === undefined) return;
     const state = sessions.get(chatId);
-    const model =
-      state.model && state.model.length > 0 ? state.model : "(SDK default)";
+    const u = users.get(userId);
+    const wsTag = state.workspaceDir
+      ? "_(chat)_"
+      : u?.workspaceDir
+        ? "_(user)_"
+        : "_(default)_";
+    const modeTag = state.permissionMode
+      ? "_(chat)_"
+      : u?.permissionMode
+        ? "_(user)_"
+        : "_(default)_";
+    const modelEff = users.effectiveModel(chatId, userId);
+    const modelDisplay = modelEff || "(SDK default)";
+    const modelTag = state.model
+      ? "_(chat)_"
+      : u?.model && u.model.length > 0
+        ? "_(user)_"
+        : "_(default)_";
     const session = state.sessionId
       ? state.sessionId.slice(0, 8) + "…"
       : "(none)";
     const cost = (state.totalCostUsd ?? 0).toFixed(4);
-    const wsTag = state.workspaceDir ? "(override)" : "(default)";
-    const modeTag = state.permissionMode ? "(override)" : "(default)";
     const allowCount = state.allowAlwaysTools?.length ?? 0;
     const denyCount = state.denyAlwaysTools?.length ?? 0;
     const lines = [
-      `*Workspace:* \`${effectiveWorkspace(state, config)}\` ${wsTag}`,
-      `*Permission mode:* ${effectiveMode(state, config)} ${modeTag}`,
-      `*Model:* ${model}`,
+      `*Workspace:* \`${users.effectiveWorkspace(chatId, userId, config.gatewayDir)}\` ${wsTag}`,
+      `*Permission mode:* ${users.effectiveMode(chatId, userId)} ${modeTag}`,
+      `*Model:* ${modelDisplay} ${modelTag}`,
+      `*TZ:* ${users.tzFor(userId)}`,
       `*Session:* ${session}`,
       `*Cost:* $${cost}`,
       `*Always rules:* ${allowCount} allow / ${denyCount} deny`,
+      `*User config:* \`data/users/${userId}.json\``,
       `*Booted:* ${new Date(bootTime).toISOString()}`,
     ];
     try {
       await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
     } catch {
-      await ctx.reply(lines.join("\n").replace(/[*`]/g, ""));
+      await ctx.reply(lines.join("\n").replace(/[*_`]/g, ""));
     }
   });
 
   bot.command("mode", async (ctx) => {
     const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const userId = ctx.from?.id;
+    if (chatId === undefined || userId === undefined) return;
     const arg = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
     const argLower = arg.toLowerCase();
     if (!arg) {
-      const state = sessions.get(chatId);
       const choices = [...VALID_PERMISSION_MODES].join(", ");
       await ctx.reply(
-        `Current permission mode: ${effectiveMode(state, config)} ${state.permissionMode ? "(override)" : "(default)"}\n` +
+        `Current permission mode: ${users.effectiveMode(chatId, userId)}\n` +
           `Usage: /mode <${choices}>\n` +
           `Shortcuts: acc/accept/edits → acceptEdits, byp/bypass/yolo → bypassPermissions\n` +
-          `Or: /mode reset — clear the override`,
+          `Or: /mode reset — clear ${isGroupChat(ctx) ? "this chat's override" : "your default"}`,
       );
       return;
     }
     if (argLower === "reset" || argLower === "default-reset") {
-      await sessions.update(chatId, { permissionMode: undefined });
+      const scope = await writeOverride(ctx, { permissionMode: undefined });
+      if (scope === null) return;
       await ctx.reply(
-        `✅ Permission mode override cleared. Effective: ${config.permissionMode}.`,
+        `✅ Permission mode cleared ${scopeNote(scope)}. Effective: ${users.effectiveMode(chatId, userId)}.`,
       );
       return;
     }
@@ -187,30 +237,33 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       );
       return;
     }
-    await sessions.update(chatId, { permissionMode: resolved });
-    await ctx.reply(`✅ Permission mode for this chat set to *${resolved}*.`, {
-      parse_mode: "Markdown",
-    });
+    const scope = await writeOverride(ctx, { permissionMode: resolved });
+    if (scope === null) return;
+    await ctx.reply(
+      `✅ Permission mode set to *${resolved}* ${scopeNote(scope)}.`,
+      { parse_mode: "Markdown" },
+    );
   });
 
   bot.command("workspace", async (ctx) => {
     const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const userId = ctx.from?.id;
+    if (chatId === undefined || userId === undefined) return;
     const arg = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
     if (!arg) {
-      const state = sessions.get(chatId);
       await ctx.reply(
-        `Current workspace: \`${effectiveWorkspace(state, config)}\` ${state.workspaceDir ? "(override)" : "(default)"}\n` +
+        `Current workspace: \`${users.effectiveWorkspace(chatId, userId, config.gatewayDir)}\`\n` +
           `Usage: /workspace <absolute-path>\n` +
-          `Or: /workspace reset — clear the override`,
+          `Or: /workspace reset — clear ${isGroupChat(ctx) ? "this chat's override" : "your default"}`,
         { parse_mode: "Markdown" },
       );
       return;
     }
     if (arg === "reset") {
-      await sessions.update(chatId, { workspaceDir: undefined });
+      const scope = await writeOverride(ctx, { workspaceDir: undefined });
+      if (scope === null) return;
       await ctx.reply(
-        `✅ Workspace override cleared. Effective: ${config.workspaceDir}.`,
+        `✅ Workspace cleared ${scopeNote(scope)}. Effective: ${users.effectiveWorkspace(chatId, userId, config.gatewayDir)}.`,
       );
       return;
     }
@@ -225,15 +278,18 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       await ctx.reply(`❌ Path does not exist: ${resolved}`);
       return;
     }
-    await sessions.update(chatId, { workspaceDir: resolved });
-    await ctx.reply(`✅ Workspace for this chat set to \`${resolved}\`.`, {
-      parse_mode: "Markdown",
-    });
+    const scope = await writeOverride(ctx, { workspaceDir: resolved });
+    if (scope === null) return;
+    await ctx.reply(
+      `✅ Workspace set to \`${resolved}\` ${scopeNote(scope)}.`,
+      { parse_mode: "Markdown" },
+    );
   });
 
   bot.command("cloudexpert", async (ctx) => {
     const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const userId = ctx.from?.id;
+    if (chatId === undefined || userId === undefined) return;
     const target = "D:\\cloudexpert";
     try {
       const stat = await fs.stat(target);
@@ -245,10 +301,12 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       await ctx.reply(`❌ Path does not exist: ${target}`);
       return;
     }
-    await sessions.update(chatId, { workspaceDir: target });
-    await ctx.reply(`✅ Workspace for this chat set to \`${target}\`.`, {
-      parse_mode: "Markdown",
-    });
+    const scope = await writeOverride(ctx, { workspaceDir: target });
+    if (scope === null) return;
+    await ctx.reply(
+      `✅ Workspace set to \`${target}\` ${scopeNote(scope)}.`,
+      { parse_mode: "Markdown" },
+    );
   });
 
   bot.command("init", async (ctx) => {
@@ -349,7 +407,8 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
 
   bot.command("model", async (ctx) => {
     const chatId = ctx.chat?.id;
-    if (chatId === undefined) return;
+    const userId = ctx.from?.id;
+    if (chatId === undefined || userId === undefined) return;
     const arg = ctx.message.text
       .split(/\s+/)
       .slice(1)
@@ -357,7 +416,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       .trim()
       .toLowerCase();
     if (!arg) {
-      const current = sessions.get(chatId).model || "(SDK default)";
+      const current = users.effectiveModel(chatId, userId) || "(SDK default)";
       const choices = Object.keys(MODEL_ALIASES).join(", ");
       await ctx.reply(`Current model: ${current}\nUsage: /model <${choices}>`);
       return;
@@ -369,11 +428,12 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       return;
     }
     const resolved = MODEL_ALIASES[arg]!;
-    await sessions.update(chatId, { model: resolved || undefined });
+    const scope = await writeOverride(ctx, { model: resolved || undefined });
+    if (scope === null) return;
     await ctx.reply(
       resolved
-        ? `✅ Model for this chat set to \`${resolved}\` (${arg}).`
-        : "✅ Model reset to SDK default.",
+        ? `✅ Model set to \`${resolved}\` (${arg}) ${scopeNote(scope)}.`
+        : `✅ Model reset to SDK default ${scopeNote(scope)}.`,
       { parse_mode: "Markdown" },
     );
   });
