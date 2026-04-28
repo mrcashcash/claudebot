@@ -11,6 +11,7 @@
 // off normally. We don't set ES_DISPLAY_REQUIRED.
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { logError } from "../state/logger.ts";
 
 let helper: ChildProcess | null = null;
 
@@ -44,6 +45,7 @@ export function start(): void {
     { stdio: "ignore", windowsHide: true, detached: false },
   );
   child.on("error", (err) => {
+    void logError("error.keepalive", err);
     console.warn("[keepalive] helper failed to start:", err);
     helper = null;
   });

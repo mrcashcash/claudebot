@@ -1,4 +1,5 @@
 import type { Cron } from "../state/crons.ts";
+import { log } from "../state/logger.ts";
 
 export interface RunnerDeps {
   /**
@@ -27,6 +28,16 @@ export function fire(deps: RunnerDeps, c: Cron, lateMs: number): void {
   console.log(
     `[cron] fire id=${c.id} chat=${c.chatId} user=${c.userId} late=${Math.round(lateMs / 1000)}s resume=${c.resume}`,
   );
+  void log({
+    category: "cron",
+    event: "cron.fired",
+    chatId: c.chatId,
+    userId: c.userId,
+    cronId: c.id,
+    lateMs,
+    oneShot: c.oneShot === true,
+    resume: c.resume,
+  });
   deps.kickOffTurnFromCron(c.chatId, c.userId, prompt, {
     triggerSource: "cron",
     persistSession: c.resume,

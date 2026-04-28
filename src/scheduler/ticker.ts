@@ -2,6 +2,7 @@ import { CronExpressionParser } from "cron-parser";
 import * as crons from "../state/crons.ts";
 import * as users from "../state/users.ts";
 import { fire, type RunnerDeps } from "./runner.ts";
+import { log, logError } from "../state/logger.ts";
 
 const TICK_MS = 60_000;
 /** Catch-up window: fire missed jobs only if their slot is within this many ms. */
@@ -56,6 +57,15 @@ async function tick(deps: RunnerDeps): Promise<void> {
           } else {
             await crons.update(c.id, { lastFiredAt: prevBucket });
           }
+          void log({
+            category: "cron",
+            event: "cron.skipped_too_old",
+            cronId: c.id,
+            chatId: c.chatId,
+            userId: c.userId,
+            lateMs,
+            oneShotDeleted: c.oneShot === true,
+          });
           continue;
         }
 
@@ -69,6 +79,19 @@ async function tick(deps: RunnerDeps): Promise<void> {
           console.log(`[cron] ${c.id} oneShot — deleted after fire`);
         }
       } catch (e) {
+        void logError("error.cron_tick", e, {
+          cronId: c.id,
+          chatId: c.chatId,
+          userId: c.userId,
+        });
+        void log({
+          category: "cron",
+          event: "cron.tick_error",
+          cronId: c.id,
+          chatId: c.chatId,
+          userId: c.userId,
+          message: e instanceof Error ? e.message : String(e),
+        });
         console.warn(
           `[cron] ${c.id} tick error: ${e instanceof Error ? e.message : String(e)}`,
         );

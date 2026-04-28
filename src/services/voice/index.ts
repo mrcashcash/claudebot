@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import type { WhisperModel } from "../../config.ts";
 import { transcribeCpp, ensureCpp, probeCpp } from "./cpp.ts";
 import { transcribeHF, ensureHF } from "./hf.ts";
+import { log } from "../../state/logger.ts";
 
 export type VoiceBackend = "cpp" | "hf";
 
@@ -74,6 +75,14 @@ async function selectBackend(
     await import("nodejs-whisper");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    void log({
+      category: "error",
+      event: "error.voice_backend",
+      level: "warn",
+      stage: "import",
+      message: msg,
+      fallback: "hf",
+    });
     console.warn(
       `[voice] cpp backend unavailable: ${msg} — falling back to transformers.js`,
     );
@@ -87,6 +96,14 @@ async function selectBackend(
     return "cpp";
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    void log({
+      category: "error",
+      event: "error.voice_backend",
+      level: "warn",
+      stage: "probe",
+      message: msg,
+      fallback: "hf",
+    });
     console.warn(
       `[voice] cpp backend unavailable: ${msg} — falling back to transformers.js`,
     );

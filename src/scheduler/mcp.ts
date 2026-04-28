@@ -2,6 +2,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { CronExpressionParser } from "cron-parser";
 import * as crons from "../state/crons.ts";
+import { log } from "../state/logger.ts";
 
 export const MAX_CRONS_PER_CHAT = 20;
 
@@ -21,8 +22,8 @@ export function buildSchedulerSystemGuidance(
 ): string {
   const isGroup = String(chatId) !== String(userId);
   const scopeAdvice = isGroup
-    ? `This conversation is a Telegram group (chatId=${chatId}, userId=${userId}). \`workspaceDir\`, \`permissionMode\`, and \`model\` can be overridden per-chat — set in this group only — and that's almost always what the user wants when they say "switch my workspace" inside a group, since changing the user file would also change every other group/DM. Recommend the slash commands \`/workspace <path>\`, \`/mode <mode>\`, \`/model <alias>\` — they auto-write to the chat layer in groups. Don't edit \`data/sessions.json\` directly from inside a turn; that file is not watched, so your edit won't take effect until the next bot restart.`
-    : `This conversation is a Telegram DM (chatId === userId). Editing \`data/users/${userId}.json\` is the right move for "switch my workspace / model / mode" requests here.`;
+    ? `This conversation is a Telegram group (chatId=${chatId}, userId=${userId}). \`workspaceDir\`, \`permissionMode\`, and \`model\` can be overridden per-chat — set in this group only — and that's almost always what the user wants when they say "switch my workspace" inside a group, since changing the user-layer setting would also change every other group/DM. Recommend the slash commands \`/workspace <path>\`, \`/mode <mode>\`, \`/model <alias>\` — they auto-write to the chat layer in groups. The \`sessions\` section of \`data/config.json\` is the live source of truth for chat-layer state, so prefer the slash commands over hand-editing it.`
+    : `This conversation is a Telegram DM (chatId === userId). Editing the \`users.${userId}\` block inside \`data/config.json\` is the right move for "switch my workspace / model / mode" requests here — the bot watches that file and reloads the next turn.`;
   return `When the user asks to be reminded about something at a future date/time, schedule it via the \`mcp__scheduler__cron_create\` tool (cron expression evaluated in ${tz}; pass \`oneShot: true\` for one-time reminders so the row auto-deletes after firing).
 
 Additionally, **if and only if** a Google Calendar MCP tool is available in this turn (look for tools whose name matches \`mcp__*calendar*__create_event\` or similar), AND the reminder is for a real-world calendar event — meeting, appointment, doctor visit, flight, dentist, interview, birthday, anniversary, deadline, class, hangout — also create a calendar event for it. Use the same date/time/timezone, put the user's phrasing as the event title, and put any context as the description.
@@ -31,7 +32,7 @@ Do NOT create a calendar event for data-pull or recurring-task crons — weather
 
 If no calendar tool is available this turn, just create the cron and don't mention calendar; the user already knows whether they wired one up.
 
-Your per-user app config lives at \`data/users/${userId}.json\`. Editable keys: \`workspaceDir\`, \`permissionMode\` (default/acceptEdits/bypassPermissions/plan), \`model\` (claude-opus-4-7/claude-sonnet-4-6/claude-haiku-4-5-20251001 or "" for SDK default), \`tz\` (IANA), \`voice\` (object with enabled/whisperModel/language/preloadModel/maxDurationSec), \`name\`, \`notes\`. The bot watches this file; edits are picked up on the next turn. Do not modify \`.env\` or other config files.
+Your per-user app config lives in \`data/config.json\` under the \`users.${userId}\` key. Editable fields: \`workspaceDir\`, \`permissionMode\` (default/acceptEdits/bypassPermissions/plan), \`model\` (claude-opus-4-7/claude-sonnet-4-6/claude-haiku-4-5-20251001 or "" for SDK default), \`tz\` (IANA), \`voice\` (object with enabled/whisperModel/language/preloadModel/maxDurationSec), \`name\`, \`notes\`. The bot watches \`data/config.json\`; edits are picked up on the next turn. The same file also holds \`sessions.<chatId>\` (per-chat runtime state and overrides) — leave that alone unless you really mean to. Do not modify \`.env\` or other config files.
 
 ${scopeAdvice}`;
 }
@@ -146,6 +147,18 @@ export function buildSchedulerMcp(chatId: number, userId: number, tz: string) {
             ...(oneShot === true ? { oneShot: true } : {}),
             ...(description ? { description } : {}),
           });
+          void log({
+            category: "cron",
+            event: "cron.created",
+            chatId,
+            userId,
+            cronId: created.id,
+            cron,
+            prompt,
+            resume: resume === true,
+            oneShot: oneShot === true,
+            description,
+          });
           return ok(
             `✅ Created cron ${created.id}\n${describeCron(created, tz)}`,
           );
@@ -181,6 +194,13 @@ export function buildSchedulerMcp(chatId: number, userId: number, tz: string) {
             );
           }
           await crons.remove(id);
+          void log({
+            category: "cron",
+            event: "cron.deleted",
+            chatId,
+            userId,
+            cronId: id,
+          });
           return ok(`🗑️ Deleted cron ${id}`);
         },
       ),

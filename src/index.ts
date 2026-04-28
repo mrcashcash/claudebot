@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { loadConfig } from "./config.ts";
 import { buildBot, COMMAND_MENU } from "./bot.ts";
+import * as store from "./state/store.ts";
 import * as sessions from "./state/sessions.ts";
 import * as users from "./state/users.ts";
 import * as crons from "./state/crons.ts";
@@ -8,13 +9,25 @@ import * as restartMarker from "./state/restart-marker.ts";
 import * as busy from "./lifecycle/busy.ts";
 import * as keepalive from "./lifecycle/keepalive.ts";
 import * as cronTicker from "./scheduler/ticker.ts";
+import { log, logError, sweepOldLogs } from "./state/logger.ts";
+
+process.on("unhandledRejection", (err) => {
+  void logError("error.uncaught_rejection", err);
+  console.error("[unhandledRejection]", err);
+});
+process.on("uncaughtException", (err) => {
+  void logError("error.uncaught_exception", err);
+  console.error("[uncaughtException]", err);
+});
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  await store.load();
   await sessions.load();
   await users.load();
   users.watch();
   await crons.load();
+  await sweepOldLogs(30);
   // Clear any stale .busy left over from a hard crash so the dev runner
   // doesn't get stuck waiting on a sentinel that no live process owns.
   await busy.reset();
@@ -57,6 +70,7 @@ async function main(): Promise<void> {
     try {
       await gracefulShutdown(sig);
     } catch (err) {
+      void logError("error.shutdown", err, { signal: sig });
       console.error("[shutdown] error during graceful shutdown:", err);
     } finally {
       keepalive.stop();
@@ -69,9 +83,18 @@ async function main(): Promise<void> {
 
   cronTicker.start({ kickOffTurnFromCron });
   await bot.launch({ dropPendingUpdates: true });
+  await log({
+    category: "lifecycle",
+    event: "lifecycle.boot",
+    userCount: userIds.length,
+    cronsLoaded: crons.allEnabled().length,
+    restartChats: marker?.chats ?? [],
+    botUsername: me.username,
+  });
 }
 
 main().catch((err) => {
+  void logError("error.fatal_main", err);
   console.error("fatal:", err);
   process.exit(1);
 });

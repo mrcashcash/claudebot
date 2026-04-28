@@ -5,7 +5,8 @@ import path from "node:path";
 import type { Config } from "../config.ts";
 import type { AskClaudeAttachment } from "../services/claude.ts";
 import * as users from "../state/users.ts";
-import { transcribeAudio } from "../services/voice/index.ts";
+import { transcribeAudio } from "../services/voice";
+import { logError } from "../state/logger.ts";
 
 const IMAGE_MEDIA_TYPES = new Set([
   "image/jpeg",
@@ -79,6 +80,11 @@ export function registerMediaHandlers(
       };
       kickOffTurn(ctx, chatId, prompt, [attachment]);
     } catch (err) {
+      void logError("error.media", err, {
+        kind: "photo",
+        chatId,
+        userId: ctx.from?.id,
+      });
       console.error("[photo] failed:", err);
       await ctx.reply(
         `Error handling photo: ${err instanceof Error ? err.message : String(err)}`,
@@ -129,6 +135,12 @@ export function registerMediaHandlers(
         `\nUse Read or another appropriate tool to inspect it.`;
       kickOffTurn(ctx, chatId, prompt);
     } catch (err) {
+      void logError("error.media", err, {
+        kind: "document",
+        chatId,
+        userId: ctx.from?.id,
+        mime,
+      });
       console.error("[document] failed:", err);
       await ctx.reply(
         `Error handling document: ${err instanceof Error ? err.message : String(err)}`,
@@ -226,6 +238,12 @@ export function registerMediaHandlers(
           (caption ? `\n\n[Caption: ${caption}]` : "");
         kickOffTurn(ctx, chatId, prompt, undefined, tArrival);
       } catch (err) {
+        void logError("error.media", err, {
+          kind: audio.kind,
+          chatId,
+          userId,
+          durationSec: audio.durationSec,
+        });
         console.error(`[${audio.kind}] failed:`, err);
         const msg = `❌ Transcription failed: ${err instanceof Error ? err.message : String(err)}`;
         if (placeholderId !== undefined) {

@@ -7,6 +7,15 @@ import * as sessions from "../state/sessions.ts";
 import * as approvals from "./approvals.ts";
 import * as questions from "./questions.ts";
 import type { TurnIO } from "./turnIO.ts";
+import { log, logError } from "../state/logger.ts";
+
+function inputSummary(input: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(input).slice(0, 500);
+  } catch {
+    return "[unserializable]";
+  }
+}
 
 const TELEGRAM_MAX_TEXT = 4096;
 const PROMPT_MAX = 3500;
@@ -146,12 +155,28 @@ export function buildCanUseTool(
     // Actual prompts they schedule still go through normal approvals when they
     // fire, with their own triggerSource=cron in effect.
     if (toolName.startsWith("mcp__scheduler__")) {
+      void log({
+        category: "approval",
+        event: "approval.auto_allow",
+        chatId,
+        tool: toolName,
+        toolUseId,
+        reason: "scheduler_mcp",
+      });
       return { behavior: "allow", updatedInput: input };
     }
 
     if (toolName === "AskUserQuestion") {
       // Cron-fired turns have no human reader to answer questions.
       if (triggerSource === "cron") {
+        void log({
+          category: "approval",
+          event: "approval.auto_deny",
+          chatId,
+          tool: toolName,
+          toolUseId,
+          reason: "cron_no_human",
+        });
         return {
           behavior: "deny",
           message:
@@ -159,6 +184,14 @@ export function buildCanUseTool(
         };
       }
       if (!isAskUserQuestionInput(input)) {
+        void log({
+          category: "approval",
+          event: "approval.auto_deny",
+          chatId,
+          tool: toolName,
+          toolUseId,
+          reason: "askquestion_bad_shape",
+        });
         return {
           behavior: "deny",
           message:
@@ -173,11 +206,26 @@ export function buildCanUseTool(
           turnSignal,
         );
         if (turnSignal.aborted) {
+          void log({
+            category: "approval",
+            event: "approval.askquestion_aborted",
+            chatId,
+            toolUseId,
+            reason: "turn_aborted",
+          });
           return {
             behavior: "deny",
             message: "Turn cancelled.",
           };
         }
+        void log({
+          category: "approval",
+          event: "approval.askquestion_answered",
+          chatId,
+          toolUseId,
+          questionsCount: input.questions.length,
+          answers,
+        });
         return {
           behavior: "allow",
           updatedInput: {
@@ -186,6 +234,7 @@ export function buildCanUseTool(
           },
         };
       } catch (err) {
+        void logError("error.askquestion", err, { chatId, toolUseId });
         console.error("[questions] failed:", err);
         return {
           behavior: "deny",
@@ -196,18 +245,45 @@ export function buildCanUseTool(
 
     const state = sessions.get(chatId);
     if (ruleMatches(toolName, state.denyAlwaysTools)) {
+      void log({
+        category: "approval",
+        event: "approval.auto_deny",
+        chatId,
+        tool: toolName,
+        toolUseId,
+        reason: "always_deny",
+        inputSummary: inputSummary(input),
+      });
       return {
         behavior: "deny",
         message: `User has set ${toolName} to always-deny in this chat.`,
       };
     }
     if (ruleMatches(toolName, state.allowAlwaysTools)) {
+      void log({
+        category: "approval",
+        event: "approval.auto_allow",
+        chatId,
+        tool: toolName,
+        toolUseId,
+        reason: "always_allow",
+        inputSummary: inputSummary(input),
+      });
       return { behavior: "allow", updatedInput: input };
     }
 
     // Cron-fired turns must not block waiting for inline-button approval —
     // there's no one watching at 08:00. Auto-deny anything not pre-approved.
     if (triggerSource === "cron") {
+      void log({
+        category: "approval",
+        event: "approval.auto_deny",
+        chatId,
+        tool: toolName,
+        toolUseId,
+        reason: "cron_no_human",
+        inputSummary: inputSummary(input),
+      });
       return {
         behavior: "deny",
         message:
@@ -228,6 +304,14 @@ export function buildCanUseTool(
         createPermissionKeyboard(toolUseId),
       );
     }
+    void log({
+      category: "approval",
+      event: "approval.prompted",
+      chatId,
+      tool: toolName,
+      toolUseId,
+      inputSummary: inputSummary(input),
+    });
 
     return await new Promise<PermissionResult>((resolve) => {
       approvals.register(toolUseId, async (choice) => {
@@ -281,6 +365,15 @@ export async function handlePermissionCallback(
   const scope = permMatch[2] as approvals.Scope;
   const toolUseId = permMatch[3]!;
   const settled = approvals.settle(toolUseId, { decision, scope });
+  void log({
+    category: "approval",
+    event: "approval.decision",
+    chatId: ctx.chat?.id,
+    userId: ctx.from?.id,
+    toolUseId,
+    decision: scope === "always" ? `always_${decision}` : decision,
+    settled,
+  });
 
   const cbLabel =
     decision === "allow"

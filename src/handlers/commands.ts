@@ -21,7 +21,8 @@ function isGroupChat(ctx: Context): boolean {
 
 /**
  * Apply a workspace/mode/model patch to the right scope: chat-layer
- * (sessions.json) in groups, user-layer (data/users/<id>.json) in DMs.
+ * (data/config.json#sessions.<chatId>) in groups, user-layer
+ * (data/config.json#users.<userId>) in DMs.
  * Returns the scope that was written, or null if context lacks ids.
  */
 async function writeOverride(
@@ -35,6 +36,14 @@ async function writeOverride(
     await sessions.update(chatId, patch);
     return "chat";
   }
+  // DM: also clear any chat-layer override on the same fields so the
+  // user-layer write isn't silently shadowed by legacy data from before
+  // chat→user→default layering existed.
+  const clearChatPatch: OverridePatch = {};
+  for (const key of Object.keys(patch) as OverrideField[]) {
+    clearChatPatch[key] = undefined;
+  }
+  await sessions.update(chatId, clearChatPatch);
   await users.update(userId, patch);
   return "user";
 }
@@ -99,6 +108,10 @@ export const COMMAND_MENU = [
     command: "new",
     description: "Start a fresh Claude session (keeps tool rules)",
   },
+  {
+    command: "cancel",
+    description: "Stop the current Claude turn (keeps session)",
+  },
   { command: "cost", description: "Show cumulative cost for this chat" },
   {
     command: "rules",
@@ -114,15 +127,19 @@ export interface CommandDeps {
   config: Config;
   bootTime: number;
   kickOffTurn: (ctx: Context, chatId: number, prompt: string) => void;
+  /** Abort the in-flight turn for a chat (if any). Returns true when there
+   * was something to abort. Used by `/new` and `/cancel`. The `reason` is
+   * stored as the AbortSignal.reason so the turn handler can log it. */
+  abortTurn: (chatId: number, reason?: string) => boolean;
 }
 
 export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
-  const { config, bootTime, kickOffTurn } = deps;
+  const { config, bootTime, kickOffTurn, abortTurn } = deps;
 
   const helpText =
     "*Telegram → Claude Code gateway*\n" +
     "Send any text and Claude works in your configured workspace " +
-    "(set in `data/users/<your-id>.json`, default is the gateway dir).\n" +
+    "(set in `data/config.json` under `users.<your-id>`, default is the gateway dir).\n" +
     "You can also send *photos* (Claude sees them), *documents* (saved to `.uploads/` for Claude to read), " +
     "and *voice messages* (transcribed locally with Whisper, no cloud).\n" +
     "When Claude wants to run a tool you'll see Allow / Always / Deny / Never buttons.\n\n" +
@@ -144,9 +161,24 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
   bot.command("new", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
+    // Abort any in-flight turn first so it can't write its old sessionId
+    // back after we clear it (the `onSessionId` callback also no-ops once
+    // the turn's controller is aborted, see bot.ts).
+    abortTurn(chatId, "user_new");
     await sessions.update(chatId, { sessionId: undefined });
     await ctx.reply(
       "🆕 Session cleared. Next message starts a fresh Claude session (tool rules preserved).",
+    );
+  });
+
+  bot.command("cancel", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const aborted = abortTurn(chatId, "user_cancel");
+    await ctx.reply(
+      aborted
+        ? "🛑 Turn cancelled. Session kept — your next message resumes the same Claude conversation."
+        : "Nothing to cancel — no turn is running.",
     );
   });
 
@@ -195,7 +227,7 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
       `*Session:* ${session}`,
       `*Cost:* $${cost}`,
       `*Always rules:* ${allowCount} allow / ${denyCount} deny`,
-      `*User config:* \`data/users/${userId}.json\``,
+      `*User config:* \`data/config.json\` → \`users.${userId}\``,
       `*Booted:* ${new Date(bootTime).toISOString()}`,
     ];
     try {

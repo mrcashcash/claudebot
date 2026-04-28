@@ -26,6 +26,7 @@ import {
   buildSchedulerSystemGuidance,
 } from "./scheduler/mcp.ts";
 import { registerCronCommands } from "./handlers/cronCommands.ts";
+import { log, logError } from "./state/logger.ts";
 
 export { COMMAND_MENU } from "./handlers/commands.ts";
 
@@ -108,6 +109,12 @@ export function buildBot(config: Config): BuiltBot {
   // is plenty.
   const bot = new Telegraf(config.telegramBotToken);
   bot.catch((err, ctx) => {
+    void logError("error.bot_global", err, {
+      updateId: ctx.update.update_id,
+      updateType: ctx.updateType,
+      chatId: ctx.chat?.id,
+      userId: ctx.from?.id,
+    });
     console.error(
       `[bot] handler error for update ${ctx.update.update_id}:`,
       err,
@@ -115,6 +122,10 @@ export function buildBot(config: Config): BuiltBot {
   });
   const inFlightChats = new Set<number>();
   const turnControllers = new Map<number, AbortController>();
+  // Per-chat FIFO queue: chained Promise tail. New messages append to the tail
+  // so turns for the same chat run serially (oldest first). Replaces the
+  // legacy "abort previous on new message" behavior — see `enqueueTurn`.
+  const turnTails = new Map<number, Promise<void>>();
   let lastActiveChat: number | null = null;
   let shuttingDown = false;
 
@@ -129,12 +140,23 @@ export function buildBot(config: Config): BuiltBot {
     // First-time authorized user: drop a default app-config file so they have
     // something to edit (and the watcher picks up further hand-edits).
     await users.ensure(userId).catch((err) => {
+      void logError("error.users_ensure", err, { userId });
       console.warn(`[users] ensure(${userId}) failed:`, err);
     });
     await next();
   });
 
-  registerCommands(bot, { config, bootTime: BOOT_TIME, kickOffTurn: kickOffTurnFromContext });
+  registerCommands(bot, {
+    config,
+    bootTime: BOOT_TIME,
+    kickOffTurn: kickOffTurnFromContext,
+    abortTurn: (chatId: number, reason?: string): boolean => {
+      const ctrl = turnControllers.get(chatId);
+      if (!ctrl) return false;
+      ctrl.abort(reason ?? "abort");
+      return true;
+    },
+  });
   registerCronCommands(bot);
 
   function userIdFromCtx(ctx: Context): number | undefined {
@@ -192,10 +214,35 @@ export function buildBot(config: Config): BuiltBot {
     prompt: string,
     opts: KickOffOptions = {},
   ): void {
-    // Fire-and-forget: see the handlerTimeout comment in buildBot. runTurn
-    // owns its own error handling; this catch is only a safety net.
-    void runTurn(io, chatId, userId, prompt, opts).catch((err) => {
-      console.error(`[turn] background error chat=${chatId}:`, err);
+    const triggerSource: TriggerSource = opts.triggerSource ?? "user";
+    const queueDepth = turnTails.has(chatId) ? 1 : 0;
+    void log({
+      category: "turn",
+      event: "turn.kickoff",
+      chatId,
+      userId,
+      promptChars: prompt.length,
+      source: triggerSource,
+      queueDepth,
+      attachments: opts.attachments?.length ?? 0,
+    });
+    // Enqueue onto the chat's serial tail Promise: a new message waits for any
+    // already-running (or already-queued) turn for the same chat to finish
+    // before its own runTurn starts. Different chats run in parallel as
+    // before. The tail Promise's `.catch` swallows errors so one failed turn
+    // can't poison the chain for the next message.
+    const prev = turnTails.get(chatId) ?? Promise.resolve();
+    const next = prev.then(() =>
+      runTurn(io, chatId, userId, prompt, opts).catch((err) => {
+        void logError("error.turn_tail", err, { chatId });
+        console.error(`[turn] background error chat=${chatId}:`, err);
+      }),
+    );
+    turnTails.set(chatId, next);
+    void next.finally(() => {
+      // Tail cleanup: only delete if we're still the latest in the chain.
+      // Otherwise a later enqueueTurn already replaced us and is waiting on us.
+      if (turnTails.get(chatId) === next) turnTails.delete(chatId);
     });
   }
 
@@ -220,19 +267,9 @@ export function buildBot(config: Config): BuiltBot {
       return;
     }
 
-    const previous = turnControllers.get(chatId);
-    if (previous) {
-      previous.abort();
-      console.log(
-        `[turn] chat=${chatId} cancelling previous turn (superseded)`,
-      );
-      try {
-        await io.reply("⏹️ Previous turn cancelled — starting new one.");
-      } catch {
-        // ignore
-      }
-    }
-
+    // Turns for the same chat run serially via `kickOffTurn`'s queue, so
+    // there's nothing to "supersede" here. The only path that aborts a
+    // running turn is `/new` and `/cancel` (via `abortTurn` in CommandDeps).
     const controller = new AbortController();
     turnControllers.set(chatId, controller);
 
@@ -260,6 +297,19 @@ export function buildBot(config: Config): BuiltBot {
     console.log(
       `[turn] start chat=${chatId} user=${userId} session=${sessionTag} model=${modelTag} mode=${modeTag}${attachTag}${triggerTag} prompt="${promptPreview}${prompt.length > 80 ? "…" : ""}"`,
     );
+    const cwdResolved = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+    void log({
+      category: "turn",
+      event: "turn.start",
+      chatId,
+      userId,
+      sessionId: resumeSessionId,
+      model: modelTag,
+      permissionMode: modeTag,
+      workspace: cwdResolved,
+      source: triggerSource,
+      persistSession,
+    });
 
     try {
       const tAskStart = Date.now();
@@ -282,11 +332,13 @@ export function buildBot(config: Config): BuiltBot {
         mcpServers: { scheduler: schedulerServer },
         appendSystemPrompt: buildSchedulerSystemGuidance(tz, userId, chatId),
         ...(additionalDirectories ? { additionalDirectories } : {}),
-        // Persist the SDK's session_id immediately so an aborted/killed turn
-        // can still be resumed from the same session next time — but only
-        // when this turn is allowed to take over the chat's session.
+        // Persist the SDK's session_id immediately so a killed turn can still
+        // be resumed from the same session next time — but only when this
+        // turn is allowed to take over the chat's session AND hasn't been
+        // aborted (otherwise a late init message could re-instate a sessionId
+        // that `/new` just cleared).
         onSessionId: async (sid: string) => {
-          if (persistSession) {
+          if (persistSession && !controller.signal.aborted) {
             await sessions.update(chatId, { sessionId: sid });
           }
         },
@@ -313,6 +365,13 @@ export function buildBot(config: Config): BuiltBot {
           !controller.signal.aborted &&
           /No conversation found with session ID/i.test(msg)
         ) {
+          void log({
+            category: "turn",
+            event: "turn.workspace_recovery",
+            chatId,
+            sessionId: resumeSessionId,
+            reason: "no_conversation_found",
+          });
           console.warn(
             `[turn] chat=${chatId} resume failed (workspace likely changed) — retrying fresh`,
           );
@@ -349,7 +408,8 @@ export function buildBot(config: Config): BuiltBot {
           ? reply.text
           : "(Claude returned an empty response)";
       const tReplyStart = Date.now();
-      for (const part of chunk(body)) {
+      const chunks = chunk(body);
+      for (const part of chunks) {
         await io.reply(part.slice(0, TELEGRAM_MAX_TEXT));
       }
       const replyMs = Date.now() - tReplyStart;
@@ -362,11 +422,53 @@ export function buildBot(config: Config): BuiltBot {
         `[turn] end chat=${chatId} session=${(reply.sessionId || resumeSessionId || "").slice(0, 8) || "new"} ` +
           `claude=${claudeMs}ms reply=${replyMs}ms total=${totalMs}ms${traceTail}`,
       );
+      void log({
+        category: "turn",
+        event: "turn.end",
+        chatId,
+        userId,
+        sessionId: reply.sessionId || resumeSessionId,
+        durationMs: totalMs,
+        claudeMs,
+        replyMs,
+        totalCostUsd: reply.costUsd,
+        replyChars: body.length,
+        chunks: chunks.length,
+        source: triggerSource,
+      });
     } catch (err) {
       if (err instanceof AskClaudeAbortedError || controller.signal.aborted) {
+        const reason = controller.signal.aborted
+          ? typeof controller.signal.reason === "string"
+            ? controller.signal.reason
+            : "aborted"
+          : "ask_claude_aborted";
+        void log({
+          category: "turn",
+          event: "turn.abort",
+          chatId,
+          userId,
+          sessionId: resumeSessionId,
+          cause: reason,
+          durationMs: Date.now() - turnStart,
+        });
         // Cancellation is intentional; the new turn already replied.
         return;
       }
+      void logError("error.turn", err, {
+        chatId,
+        userId,
+        sessionId: resumeSessionId,
+      });
+      void log({
+        category: "turn",
+        event: "turn.error",
+        chatId,
+        userId,
+        sessionId: resumeSessionId,
+        durationMs: Date.now() - turnStart,
+        message: err instanceof Error ? err.message : String(err),
+      });
       console.error("[claude] error handling message:", err);
       try {
         await io.reply(
@@ -410,20 +512,29 @@ export function buildBot(config: Config): BuiltBot {
   async function gracefulShutdown(reason: string): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    const shutdownStart = Date.now();
 
     // Mark restart intent first so resumed/new processes know there was a
     // pending reload, even if we end up forced-killed during the wait.
     const chatsForMarker = new Set<number>(inFlightChats);
     if (lastActiveChat !== null) chatsForMarker.add(lastActiveChat);
+    void log({
+      category: "lifecycle",
+      event: "lifecycle.shutdown.start",
+      reason,
+      affectedChats: [...chatsForMarker],
+      inFlightCount: inFlightChats.size,
+    });
     await restartMarker
       .write({
         chats: [...chatsForMarker],
         reason,
         shutdownAt: Date.now(),
       })
-      .catch((err) =>
-        console.error("[shutdown] restart-marker write failed:", err),
-      );
+      .catch((err) => {
+        void logError("error.restart_marker_write", err);
+        console.error("[shutdown] restart-marker write failed:", err);
+      });
 
     // Wait for in-flight turns to finish naturally instead of aborting them.
     // This is what the user wants: when tsx watch reloads after Claude edits
@@ -449,10 +560,16 @@ export function buildBot(config: Config): BuiltBot {
         await new Promise((r) => setTimeout(r, 500));
       }
       if (inFlightChats.size > 0) {
+        void log({
+          category: "lifecycle",
+          event: "lifecycle.shutdown.drain_timeout",
+          pendingChats: [...inFlightChats],
+          waitedMs: SHUTDOWN_DRAIN_MS,
+        });
         console.warn(
           `[shutdown] ${inFlightChats.size} turn(s) still running after ${SHUTDOWN_DRAIN_MS / 60000}min; aborting`,
         );
-        for (const ctrl of turnControllers.values()) ctrl.abort();
+        for (const ctrl of turnControllers.values()) ctrl.abort("shutdown");
         await Promise.allSettled(
           [...inFlightChats].map((id) =>
             bot.telegram.sendMessage(
@@ -468,6 +585,7 @@ export function buildBot(config: Config): BuiltBot {
       console.log(`[shutdown] ${reason} — no in-flight turns, restarting`);
     }
 
+    const forcedAbort = inFlightChats.size > 0;
     turnControllers.clear();
     approvals.denyAll();
     questions.cancelAll();
@@ -475,9 +593,16 @@ export function buildBot(config: Config): BuiltBot {
 
     try {
       bot.stop(reason);
-    } catch {
-      // ignore
+    } catch (err) {
+      void logError("error.bot_stop", err);
     }
+    void log({
+      category: "lifecycle",
+      event: "lifecycle.shutdown.complete",
+      reason,
+      durationMs: Date.now() - shutdownStart,
+      forcedAbort,
+    });
   }
 
   return { bot, kickOffTurnFromCron, gracefulShutdown };

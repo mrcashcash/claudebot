@@ -9,6 +9,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { PermissionMode } from "../config.ts";
 import * as turnLog from "../state/turnLog.ts";
+import { logError } from "../state/logger.ts";
 
 export interface ClaudeReply {
   text: string;
@@ -190,6 +191,7 @@ export async function askClaude(
   const options: Options = {
     cwd: opts.cwd,
     permissionMode: opts.permissionMode,
+    settingSources: ["user", "project", "local"],
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
@@ -241,6 +243,7 @@ export async function askClaude(
           try {
             await opts.onSessionId(sessionId);
           } catch (err) {
+            void logError("error.on_session_id", err, { sessionId });
             console.warn("[claude] onSessionId callback failed:", err);
           }
         }
