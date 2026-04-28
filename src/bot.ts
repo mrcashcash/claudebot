@@ -21,6 +21,10 @@ import {
 } from "./handlers/toolApprovals.ts";
 import { registerMediaHandlers } from "./handlers/mediaHandlers.ts";
 import { ioFromContext, ioFromTelegram, type TurnIO } from "./handlers/turnIO.ts";
+import { createStreamingReply } from "./handlers/streamingReply.ts";
+import { buildReplyContext } from "./handlers/replyContext.ts";
+import { synthesize, TtsConfigError } from "./services/voice/tts.ts";
+import { shouldRespond } from "./handlers/respondGate.ts";
 import {
   buildSchedulerMcp,
   buildSchedulerSystemGuidance,
@@ -47,6 +51,52 @@ function chunk(text: string): string[] {
   }
   if (remaining.length > 0) out.push(remaining);
   return out;
+}
+
+async function maybeSendVoiceReply(args: {
+  io: TurnIO;
+  chatId: number;
+  userId: number;
+  text: string;
+  inputWasVoice: boolean;
+}): Promise<void> {
+  const voice = users.voiceFor(args.userId);
+  if (!voice.tts.enabled) return;
+  const should =
+    voice.replyMode === "voice" ||
+    (voice.replyMode === "auto" && args.inputWasVoice);
+  if (!should) return;
+  if (args.text.length > voice.tts.maxChars) {
+    console.log(
+      `[tts] chat=${args.chatId} skipped: reply ${args.text.length} chars > maxChars ${voice.tts.maxChars}`,
+    );
+    return;
+  }
+  try {
+    const t0 = Date.now();
+    const result = await synthesize(args.text, voice.tts);
+    const ttsMs = Date.now() - t0;
+    if (result.format === "opus") {
+      await args.io.telegram.sendVoice(args.chatId, {
+        source: result.audio,
+        filename: "reply.ogg",
+      });
+    } else {
+      await args.io.telegram.sendAudio(args.chatId, {
+        source: result.audio,
+        filename: "reply.mp3",
+      });
+    }
+    console.log(
+      `[tts] chat=${args.chatId} synth=${ttsMs}ms bytes=${result.audio.length} fmt=${result.format} backend=${voice.tts.backend} model=${voice.tts.model}`,
+    );
+  } catch (err) {
+    if (err instanceof TtsConfigError) {
+      console.warn(`[tts] chat=${args.chatId} skipped: ${err.message}`);
+    } else {
+      console.error(`[tts] chat=${args.chatId} failed:`, err);
+    }
+  }
 }
 
 function startTypingLoop(io: TurnIO): () => void {
@@ -85,6 +135,12 @@ export interface KickOffOptions {
    * interactive Claude session.
    */
   persistSession?: boolean;
+  /**
+   * True when the originating user message was a voice/audio note. Combines
+   * with the user's voice.replyMode to decide whether to also synthesize the
+   * reply as a voice message. Defaults to false.
+   */
+  inputWasVoice?: boolean;
 }
 
 export interface BuiltBot {
@@ -197,6 +253,7 @@ export function buildBot(config: Config): BuiltBot {
     prompt: string,
     attachments?: AskClaudeAttachment[],
     traceStart?: number,
+    inputWasVoice?: boolean,
   ): void {
     const userId = userIdFromCtx(ctx);
     if (userId === undefined) return; // auth middleware already rejected
@@ -204,6 +261,7 @@ export function buildBot(config: Config): BuiltBot {
     kickOffTurn(io, chatId, userId, prompt, {
       ...(attachments ? { attachments } : {}),
       ...(traceStart !== undefined ? { traceStart } : {}),
+      ...(inputWasVoice ? { inputWasVoice: true } : {}),
     });
   }
 
@@ -276,6 +334,7 @@ export function buildBot(config: Config): BuiltBot {
     const state = sessions.get(chatId);
     const stopTyping = startTypingLoop(io);
     const canUseTool = buildCanUseTool(io, chatId, controller.signal, triggerSource);
+    const stream = createStreamingReply(io);
     inFlightChats.add(chatId);
     void busy.acquire();
     lastActiveChat = chatId;
@@ -332,6 +391,7 @@ export function buildBot(config: Config): BuiltBot {
         mcpServers: { scheduler: schedulerServer },
         appendSystemPrompt: buildSchedulerSystemGuidance(tz, userId, chatId),
         ...(additionalDirectories ? { additionalDirectories } : {}),
+        onTextDelta: (_delta: string, full: string) => stream.push(full),
         // Persist the SDK's session_id immediately so a killed turn can still
         // be resumed from the same session next time — but only when this
         // turn is allowed to take over the chat's session AND hasn't been
@@ -409,10 +469,17 @@ export function buildBot(config: Config): BuiltBot {
           : "(Claude returned an empty response)";
       const tReplyStart = Date.now();
       const chunks = chunk(body);
-      for (const part of chunks) {
-        await io.reply(part.slice(0, TELEGRAM_MAX_TEXT));
-      }
+      await stream.finalize(chunks);
       const replyMs = Date.now() - tReplyStart;
+      if (reply.text.length > 0) {
+        await maybeSendVoiceReply({
+          io,
+          chatId,
+          userId,
+          text: reply.text,
+          inputWasVoice: opts.inputWasVoice === true,
+        });
+      }
       const totalMs = Date.now() - turnStart;
       const traceTail =
         opts.traceStart !== undefined
@@ -452,7 +519,12 @@ export function buildBot(config: Config): BuiltBot {
           cause: reason,
           durationMs: Date.now() - turnStart,
         });
-        // Cancellation is intentional; the new turn already replied.
+        // Cancellation is intentional; the new turn already replied. If we
+        // had streamed a partial message, mark it cancelled so the user
+        // doesn't see a frozen "…" placeholder forever.
+        if (stream.hasPlaceholder()) {
+          await stream.fail("⏹️ Cancelled.").catch(() => {});
+        }
         return;
       }
       void logError("error.turn", err, {
@@ -470,10 +542,13 @@ export function buildBot(config: Config): BuiltBot {
         message: err instanceof Error ? err.message : String(err),
       });
       console.error("[claude] error handling message:", err);
+      const errText = `Error talking to Claude: ${err instanceof Error ? err.message : String(err)}`;
       try {
-        await io.reply(
-          `Error talking to Claude: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        if (stream.hasPlaceholder()) {
+          await stream.fail(errText);
+        } else {
+          await io.reply(errText);
+        }
       } catch {
         // Bot may already be shutting down.
       }
@@ -506,7 +581,9 @@ export function buildBot(config: Config): BuiltBot {
     const chatId = ctx.chat.id;
     const text = ctx.message.text;
     if (text.startsWith("/")) return;
-    kickOffTurnFromContext(ctx, chatId, text);
+    if (!shouldRespond(ctx)) return;
+    const prompt = buildReplyContext(ctx.message.reply_to_message) + text;
+    kickOffTurnFromContext(ctx, chatId, prompt);
   });
 
   async function gracefulShutdown(reason: string): Promise<void> {

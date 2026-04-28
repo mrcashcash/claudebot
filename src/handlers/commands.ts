@@ -1,10 +1,11 @@
 import { Telegraf, type Context } from "telegraf";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { Config, PermissionMode } from "../config.ts";
-import { VALID_PERMISSION_MODES } from "../config.ts";
+import type { Config, PermissionMode, VoiceReplyMode } from "../config.ts";
+import { VALID_PERMISSION_MODES, VALID_VOICE_REPLY_MODES } from "../config.ts";
 import * as sessions from "../state/sessions.ts";
 import * as users from "../state/users.ts";
+import { VALID_RESPOND_MODES, type RespondMode } from "./respondGate.ts";
 
 type OverrideField = "workspaceDir" | "permissionMode" | "model";
 type OverridePatch = Partial<Pick<sessions.ChatState, OverrideField>>;
@@ -121,6 +122,14 @@ export const COMMAND_MENU = [
     command: "cron",
     description: "List / pause / resume / delete scheduled crons",
   },
+  {
+    command: "voice",
+    description: "Voice reply mode: text / voice / auto",
+  },
+  {
+    command: "respond",
+    description: "Group gate: always / mention / reply (groups only)",
+  },
 ] as const;
 
 export interface CommandDeps {
@@ -219,11 +228,17 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     const cost = (state.totalCostUsd ?? 0).toFixed(4);
     const allowCount = state.allowAlwaysTools?.length ?? 0;
     const denyCount = state.denyAlwaysTools?.length ?? 0;
+    const v = users.voiceFor(userId);
+    const voiceLine = `${v.replyMode}${v.tts.enabled ? "" : " (TTS off)"}`;
     const lines = [
       `*Workspace:* \`${users.effectiveWorkspace(chatId, userId, config.gatewayDir)}\` ${wsTag}`,
       `*Permission mode:* ${users.effectiveMode(chatId, userId)} ${modeTag}`,
       `*Model:* ${modelDisplay} ${modelTag}`,
       `*TZ:* ${users.tzFor(userId)}`,
+      `*Voice reply:* ${voiceLine}`,
+      ...(isGroupChat(ctx)
+        ? [`*Respond:* ${state.respondTo ?? "always"}`]
+        : []),
       `*Session:* ${session}`,
       `*Cost:* $${cost}`,
       `*Always rules:* ${allowCount} allow / ${denyCount} deny`,
@@ -435,6 +450,92 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
     } catch {
       await ctx.reply(lines.join("\n").replace(/[*_`]/g, ""));
     }
+  });
+
+  bot.command("respond", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    if (!isGroupChat(ctx)) {
+      await ctx.reply(
+        "This command only applies in groups. DMs always respond.",
+      );
+      return;
+    }
+    const arg = ctx.message.text
+      .split(/\s+/)
+      .slice(1)
+      .join(" ")
+      .trim()
+      .toLowerCase();
+    const current = sessions.get(chatId).respondTo ?? "always";
+    if (!arg) {
+      const choices = [...VALID_RESPOND_MODES].join(", ");
+      await ctx.reply(
+        `Group respond mode: ${current}\n` +
+          `Usage: /respond <${choices}>\n` +
+          `always = respond to every message (default)\n` +
+          `mention = respond only when @-mentioned or replied to\n` +
+          `reply = respond only when someone replies to a bot message`,
+      );
+      return;
+    }
+    if (!VALID_RESPOND_MODES.has(arg as RespondMode)) {
+      await ctx.reply(
+        `Unknown mode "${arg}". Choose: ${[...VALID_RESPOND_MODES].join(", ")}`,
+      );
+      return;
+    }
+    const next = arg as RespondMode;
+    await sessions.update(chatId, { respondTo: next });
+    await ctx.reply(`✅ Group respond mode set to *${next}*.`, {
+      parse_mode: "Markdown",
+    });
+  });
+
+  bot.command("voice", async (ctx) => {
+    const userId = ctx.from?.id;
+    if (userId === undefined) return;
+    const arg = ctx.message.text
+      .split(/\s+/)
+      .slice(1)
+      .join(" ")
+      .trim()
+      .toLowerCase();
+    const current = users.voiceFor(userId);
+    if (!arg) {
+      const choices = [...VALID_VOICE_REPLY_MODES].join(", ");
+      const ttsState = current.tts.enabled
+        ? `enabled (${current.tts.backend} ${current.tts.model}, voice=${current.tts.voice})`
+        : "disabled";
+      await ctx.reply(
+        `Voice reply mode: ${current.replyMode}\n` +
+          `TTS: ${ttsState}\n` +
+          `Usage: /voice <${choices}>\n` +
+          `text = always reply with text only\n` +
+          `voice = also send a voice reply on every turn\n` +
+          `auto = voice reply only when you sent a voice message\n` +
+          `(TTS itself stays controlled by voice.tts.enabled in your config.)`,
+      );
+      return;
+    }
+    if (!VALID_VOICE_REPLY_MODES.has(arg as VoiceReplyMode)) {
+      await ctx.reply(
+        `Unknown mode "${arg}". Choose: ${[...VALID_VOICE_REPLY_MODES].join(", ")}`,
+      );
+      return;
+    }
+    const next = arg as VoiceReplyMode;
+    const existingVoice = users.get(userId)?.voice ?? {};
+    await users.update(userId, {
+      voice: { ...existingVoice, replyMode: next },
+    });
+    const note =
+      next !== "text" && !current.tts.enabled
+        ? "\n\n⚠️ TTS is currently off — set `voice.tts.enabled: true` in your config to actually hear voice replies (and add OPENAI_API_KEY to env)."
+        : "";
+    await ctx.reply(`✅ Voice reply mode set to *${next}* as your default.${note}`, {
+      parse_mode: "Markdown",
+    });
   });
 
   bot.command("model", async (ctx) => {

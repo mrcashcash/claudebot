@@ -1,6 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PermissionMode, VoiceConfig, WhisperModel } from "../config.ts";
+import type {
+  PermissionMode,
+  TtsConfig,
+  VoiceConfig,
+  VoiceReplyMode,
+  WhisperModel,
+} from "../config.ts";
 import {
   validateUserConfig,
   type UserConfig,
@@ -15,6 +21,15 @@ const TEMPLATE = path.join(process.cwd(), "userTemplate.json");
 const DEFAULT_TZ = "Asia/Jerusalem";
 const DEFAULT_PERMISSION_MODE: PermissionMode = "acceptEdits";
 
+const TTS_DEFAULTS: TtsConfig = {
+  enabled: false,
+  backend: "openai",
+  model: "tts-1",
+  voice: "alloy",
+  format: "opus",
+  maxChars: 4000,
+};
+
 const VOICE_DEFAULTS: VoiceConfig = {
   enabled: true,
   whisperModel: "base.en" satisfies WhisperModel as WhisperModel,
@@ -22,6 +37,8 @@ const VOICE_DEFAULTS: VoiceConfig = {
   ffmpegPath: undefined,
   preloadModel: false,
   maxDurationSec: 600,
+  replyMode: "text" satisfies VoiceReplyMode as VoiceReplyMode,
+  tts: TTS_DEFAULTS,
 };
 
 let loaded = false;
@@ -133,6 +150,15 @@ export async function update(
 export function voiceFor(userId: number): VoiceConfig {
   const u = store.getUsers()[String(userId)];
   const v = u?.voice ?? {};
+  const tIn = v.tts ?? {};
+  const tts: TtsConfig = {
+    enabled: tIn.enabled ?? TTS_DEFAULTS.enabled,
+    backend: tIn.backend ?? TTS_DEFAULTS.backend,
+    model: tIn.model ?? TTS_DEFAULTS.model,
+    voice: tIn.voice ?? TTS_DEFAULTS.voice,
+    format: tIn.format ?? TTS_DEFAULTS.format,
+    maxChars: tIn.maxChars ?? TTS_DEFAULTS.maxChars,
+  };
   return {
     enabled: v.enabled ?? VOICE_DEFAULTS.enabled,
     whisperModel: v.whisperModel ?? VOICE_DEFAULTS.whisperModel,
@@ -140,6 +166,8 @@ export function voiceFor(userId: number): VoiceConfig {
     ffmpegPath: v.ffmpegPath ?? VOICE_DEFAULTS.ffmpegPath,
     preloadModel: v.preloadModel ?? VOICE_DEFAULTS.preloadModel,
     maxDurationSec: v.maxDurationSec ?? VOICE_DEFAULTS.maxDurationSec,
+    replyMode: v.replyMode ?? VOICE_DEFAULTS.replyMode,
+    tts,
   };
 }
 

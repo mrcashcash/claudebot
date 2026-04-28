@@ -20,6 +20,12 @@ export interface ChatState {
   workspaceDir?: string;
   permissionMode?: PermissionMode;
   model?: string;
+  /**
+   * Group-only gate. "always" (default) responds to every message;
+   * "mention" requires the bot to be @-mentioned or replied to; "reply"
+   * requires a reply to a bot message. DMs ignore this and always respond.
+   */
+  respondTo?: "always" | "mention" | "reply";
 }
 
 export interface AppConfig {

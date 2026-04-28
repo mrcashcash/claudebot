@@ -57,6 +57,12 @@ export interface AskClaudeOptions {
    * message alone (e.g. when to mirror a reminder into Google Calendar).
    */
   appendSystemPrompt?: string;
+  /**
+   * Fires every time an assistant text block arrives. The caller gets the
+   * delta and the full accumulated text so far. Used by bot.ts to live-edit
+   * a Telegram placeholder message as Claude streams.
+   */
+  onTextDelta?: (delta: string, full: string) => void;
 }
 
 export class AskClaudeAbortedError extends Error {
@@ -249,7 +255,16 @@ export async function askClaude(
         }
       } else if (m.type === "assistant") {
         for (const block of m.message.content) {
-          if (block.type === "text") assistantText += block.text;
+          if (block.type === "text") {
+            assistantText += block.text;
+            if (opts.onTextDelta) {
+              try {
+                opts.onTextDelta(block.text, assistantText);
+              } catch (err) {
+                console.warn("[claude] onTextDelta callback failed:", err);
+              }
+            }
+          }
         }
       } else if (m.type === "result") {
         const anyM = m as {

@@ -10,6 +10,15 @@
     "whisperModel": "base.en",
     "language": "en",
     "preloadModel": false,
-    "maxDurationSec": 600
+    "maxDurationSec": 600,
+    "replyMode": "text",
+    "tts": {
+      "enabled": false,
+      "backend": "openai",
+      "model": "tts-1",
+      "voice": "alloy",
+      "format": "opus",
+      "maxChars": 4000
+    }
   }
 }

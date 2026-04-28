@@ -1,8 +1,11 @@
 import {
   VALID_PERMISSION_MODES,
+  VALID_VOICE_REPLY_MODES,
   VALID_WHISPER_MODELS,
   type PermissionMode,
+  type TtsConfig,
   type VoiceConfig,
+  type VoiceReplyMode,
   type WhisperModel,
 } from "./config.ts";
 
@@ -39,6 +42,24 @@ export function parseWhisperModel(raw: unknown): WhisperModel {
   return v as WhisperModel;
 }
 
+export function parseVoiceReplyMode(raw: unknown): VoiceReplyMode {
+  const v = (typeof raw === "string" ? raw.trim() : "") || "text";
+  if (!VALID_VOICE_REPLY_MODES.has(v as VoiceReplyMode)) {
+    throw new Error(
+      `voice.replyMode must be one of ${[...VALID_VOICE_REPLY_MODES].join(", ")}`,
+    );
+  }
+  return v as VoiceReplyMode;
+}
+
+export function parseTtsFormat(raw: unknown): "opus" | "mp3" {
+  const v = (typeof raw === "string" ? raw.trim().toLowerCase() : "") || "opus";
+  if (v !== "opus" && v !== "mp3") {
+    throw new Error(`voice.tts.format must be "opus" or "mp3"; got: ${String(raw)}`);
+  }
+  return v;
+}
+
 export function parseLanguage(raw: unknown): string | undefined {
   if (raw === undefined || raw === null) return undefined;
   const v = String(raw).trim();
@@ -66,12 +87,22 @@ export function parsePositiveInt(
   return n;
 }
 
+/**
+ * Voice config as it's stored on disk: every field optional, including a
+ * partial TTS sub-config. `voiceFor` in users.ts merges this with defaults
+ * to produce a fully-resolved VoiceConfig at read time.
+ */
+export interface UserVoiceConfig
+  extends Partial<Omit<VoiceConfig, "tts">> {
+  tts?: Partial<TtsConfig>;
+}
+
 export interface UserConfig {
   workspaceDir?: string;
   permissionMode?: PermissionMode;
   /** SDK model id, e.g. "claude-opus-4-7". Empty/absent = SDK default. */
   model?: string;
-  voice?: Partial<VoiceConfig>;
+  voice?: UserVoiceConfig;
   /** IANA tz, e.g. "Asia/Jerusalem". */
   tz?: string;
   name?: string;
@@ -121,7 +152,7 @@ export function validateUserConfig(raw: unknown): UserConfig {
       throw new Error("voice must be an object");
     }
     const v = obj.voice as Record<string, unknown>;
-    const voice: Partial<VoiceConfig> = {};
+    const voice: UserVoiceConfig = {};
     if (v.enabled !== undefined) voice.enabled = parseBool(v.enabled, true);
     if (v.whisperModel !== undefined && v.whisperModel !== "") {
       voice.whisperModel = parseWhisperModel(v.whisperModel);
@@ -140,6 +171,34 @@ export function validateUserConfig(raw: unknown): UserConfig {
         600,
         "voice.maxDurationSec",
       );
+    }
+    if (v.replyMode !== undefined && v.replyMode !== "") {
+      voice.replyMode = parseVoiceReplyMode(v.replyMode);
+    }
+    if (v.tts !== undefined && v.tts !== null) {
+      if (typeof v.tts !== "object") {
+        throw new Error("voice.tts must be an object");
+      }
+      const t = v.tts as Record<string, unknown>;
+      const tts: Partial<TtsConfig> = {};
+      if (t.enabled !== undefined) tts.enabled = parseBool(t.enabled, false);
+      if (t.backend !== undefined && t.backend !== "") {
+        if (t.backend !== "openai") {
+          throw new Error(`voice.tts.backend must be "openai"; got: ${String(t.backend)}`);
+        }
+        tts.backend = "openai";
+      }
+      const ttsModel = pickString(t.model);
+      if (ttsModel) tts.model = ttsModel;
+      const ttsVoice = pickString(t.voice);
+      if (ttsVoice) tts.voice = ttsVoice;
+      if (t.format !== undefined && t.format !== "") {
+        tts.format = parseTtsFormat(t.format);
+      }
+      if (t.maxChars !== undefined && t.maxChars !== "") {
+        tts.maxChars = parsePositiveInt(t.maxChars, 4000, "voice.tts.maxChars");
+      }
+      if (Object.keys(tts).length > 0) voice.tts = tts;
     }
     if (Object.keys(voice).length > 0) out.voice = voice;
   }

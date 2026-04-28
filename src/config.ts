@@ -17,6 +17,21 @@ export type WhisperModel =
   | "large"
   | "large-v3-turbo";
 
+export type VoiceReplyMode = "text" | "voice" | "auto";
+
+export interface TtsConfig {
+  enabled: boolean;
+  backend: "openai";
+  /** Backend model id, e.g. "tts-1" / "tts-1-hd" / "gpt-4o-mini-tts". */
+  model: string;
+  /** Backend voice id, e.g. "alloy" / "nova" / "shimmer". */
+  voice: string;
+  /** Container/codec; Telegram voice messages need ogg/opus. */
+  format: "opus" | "mp3";
+  /** Skip synthesis when the reply text exceeds this many chars. */
+  maxChars: number;
+}
+
 export interface VoiceConfig {
   enabled: boolean;
   whisperModel: WhisperModel;
@@ -28,7 +43,22 @@ export interface VoiceConfig {
   preloadModel: boolean;
   /** Telegram voice messages longer than this are rejected. */
   maxDurationSec: number;
+  /**
+   * When to send Claude's reply as a voice message.
+   * - "text" (default): never; always reply with text only.
+   * - "voice": always synthesize the reply (in addition to the text message).
+   * - "auto": synthesize only when the user's input was a voice message.
+   */
+  replyMode: VoiceReplyMode;
+  /** TTS backend config. Only consulted when replyMode triggers a synth. */
+  tts: TtsConfig;
 }
+
+export const VALID_VOICE_REPLY_MODES: ReadonlySet<VoiceReplyMode> = new Set([
+  "text",
+  "voice",
+  "auto",
+]);
 
 export interface Config {
   telegramBotToken: string;
