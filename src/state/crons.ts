@@ -2,11 +2,16 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 
+export type Transport = "telegram" | "slack";
+
 export interface Cron {
   id: string;
-  chatId: number;
-  /** Telegram user id who created the cron — drives per-user config lookups when the cron fires. */
-  userId: number;
+  /** Stringified chat id. Telegram numeric ids are stringified at the boundary; Slack ids ("C…", "D…") are already strings. */
+  chatId: string;
+  /** User id who created the cron — drives per-user config lookups (TZ, workspace, mode) when the cron fires. */
+  userId: number | string;
+  /** Which transport's `kickOffTurnFromCron` to invoke at fire time. */
+  transport: Transport;
   cron: string;
   prompt: string;
   createdAt: number;
@@ -35,27 +40,55 @@ export async function load(): Promise<void> {
   try {
     const raw = await fs.readFile(FILE, "utf8");
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") cache = parsed as Store;
+    if (parsed && typeof parsed === "object") {
+      // Migrate legacy rows: numeric chatId/userId → strings, missing transport → "telegram".
+      const out: Store = {};
+      for (const [id, raw] of Object.entries(parsed as Record<string, unknown>)) {
+        if (!raw || typeof raw !== "object") continue;
+        const o = raw as Record<string, unknown>;
+        if (
+          typeof o.cron !== "string" ||
+          typeof o.prompt !== "string" ||
+          typeof o.enabled !== "boolean"
+        )
+          continue;
+        if (o.userId === undefined || o.userId === null) continue;
+        const chatId =
+          typeof o.chatId === "number" || typeof o.chatId === "string"
+            ? String(o.chatId)
+            : null;
+        if (!chatId) continue;
+        const transport: Transport =
+          o.transport === "slack" ? "slack" : "telegram";
+        out[id] = {
+          id,
+          chatId,
+          userId:
+            typeof o.userId === "number" ? o.userId : String(o.userId),
+          transport,
+          cron: o.cron,
+          prompt: o.prompt,
+          createdAt:
+            typeof o.createdAt === "number" ? o.createdAt : Date.now(),
+          lastFiredAt:
+            typeof o.lastFiredAt === "number" ? o.lastFiredAt : undefined,
+          enabled: o.enabled,
+          resume: o.resume === true,
+          ...(o.oneShot === true ? { oneShot: true } : {}),
+          ...(typeof o.description === "string"
+            ? { description: o.description }
+            : {}),
+        };
+      }
+      cache = out;
+    }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     cache = {};
   }
-  // Migration: drop rows missing userId (added when configs went per-user).
-  // Per-user config lookups need a userId; a row without one can't fire safely.
-  let dropped = 0;
-  for (const [id, c] of Object.entries(cache)) {
-    if (typeof (c as Cron).userId !== "number") {
-      delete cache[id];
-      dropped += 1;
-    }
-  }
-  if (dropped > 0) {
-    console.warn(
-      `[crons] dropped ${dropped} legacy row(s) missing userId — recreate them via /cron or by asking Claude`,
-    );
-    await persist();
-  }
   loaded = true;
+  // Re-persist if migration changed anything (cheap; idempotent).
+  await persist();
 }
 
 function assertLoaded(): void {
@@ -79,7 +112,7 @@ export function get(id: string): Cron | undefined {
   return cache[id];
 }
 
-export function list(chatId?: number): Cron[] {
+export function list(chatId?: string): Cron[] {
   assertLoaded();
   const all = Object.values(cache);
   return chatId === undefined ? all : all.filter((c) => c.chatId === chatId);
@@ -90,7 +123,7 @@ export function allEnabled(): Cron[] {
   return Object.values(cache).filter((c) => c.enabled);
 }
 
-export function countByChat(chatId: number): number {
+export function countByChat(chatId: string): number {
   assertLoaded();
   let n = 0;
   for (const c of Object.values(cache)) if (c.chatId === chatId) n += 1;

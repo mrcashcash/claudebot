@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Config } from "../config.ts";
 import type { AskClaudeAttachment } from "../services/claude.ts";
-import type { KickOffFromCtxOptions } from "../bot.ts";
+import type { KickOffFromCtxOptions } from "./app.ts";
 import * as users from "../state/users.ts";
 import { transcribeAudio } from "../services/voice/index.ts";
 import { logError } from "../state/logger.ts";
@@ -30,7 +30,7 @@ export interface MediaHandlerDeps {
   config: Config;
   kickOffTurn: (
     ctx: Context,
-    chatId: number,
+    chatId: string,
     prompt: string,
     opts?: KickOffFromCtxOptions,
   ) => void;
@@ -50,7 +50,8 @@ function sanitizeFilename(name: string): string {
 }
 
 interface PendingAlbum {
-  chatId: number;
+  chatId: string;
+  chatIdNum: number;
   /** Any ctx from a same-album photo; kickOffTurn only needs ctx for telegram + from. */
   ctxAny: Context;
   attachments: AskClaudeAttachment[];
@@ -80,7 +81,7 @@ export function registerMediaHandlers(
   /** Build the image-attachment shape and fire a turn. */
   function dispatchImages(
     ctx: Context,
-    chatId: number,
+    chatId: string,
     replyContext: string,
     caption: string,
     attachments: AskClaudeAttachment[],
@@ -116,7 +117,8 @@ export function registerMediaHandlers(
   }
 
   bot.on(message("photo"), async (ctx) => {
-    const chatId = ctx.chat.id;
+    const chatIdNum = ctx.chat.id;
+    const chatId = String(chatIdNum);
     const sizes = ctx.message.photo;
     const largest = sizes[sizes.length - 1];
     if (!largest) {
@@ -174,6 +176,7 @@ export function registerMediaHandlers(
     if (!album) {
       album = {
         chatId,
+        chatIdNum,
         ctxAny: ctx,
         attachments: [],
         caption: "",
@@ -195,7 +198,8 @@ export function registerMediaHandlers(
 
   bot.on(message("document"), async (ctx) => {
     if (!shouldRespond(ctx)) return;
-    const chatId = ctx.chat.id;
+    const chatIdNum = ctx.chat.id;
+    const chatId = String(chatIdNum);
     const doc = ctx.message.document;
     const mime = doc.mime_type ?? "application/octet-stream";
     const caption =
@@ -254,11 +258,12 @@ export function registerMediaHandlers(
   // Telegraf polling loop would stall while a 30-second clip transcribes.
   const handleAudioMessage = (
     ctx: Context,
-    chatId: number,
+    chatIdNum: number,
     audio: IncomingAudio,
     caption: string,
     replyContext: string,
   ): void => {
+    const chatId = String(chatIdNum);
     const userId = ctx.from?.id;
     if (userId === undefined) return;
     const voice = users.voiceFor(userId);
@@ -320,7 +325,7 @@ export function registerMediaHandlers(
         // Transcript is fed silently to Claude — drop the placeholder.
         if (placeholderId !== undefined) {
           await ctx.telegram
-            .deleteMessage(chatId, placeholderId)
+            .deleteMessage(chatIdNum, placeholderId)
             .catch(() => {});
           placeholderId = undefined;
         }
@@ -353,7 +358,7 @@ export function registerMediaHandlers(
         if (placeholderId !== undefined) {
           try {
             await ctx.telegram.editMessageText(
-              chatId,
+              chatIdNum,
               placeholderId,
               undefined,
               msg,
@@ -370,14 +375,14 @@ export function registerMediaHandlers(
 
   bot.on(message("voice"), (ctx) => {
     if (!shouldRespond(ctx)) return;
-    const chatId = ctx.chat.id;
+    const chatIdNum = ctx.chat.id;
     const v = ctx.message.voice;
     const caption =
       typeof ctx.message.caption === "string" ? ctx.message.caption : "";
     const replyContext = buildReplyContext(ctx.message.reply_to_message);
     handleAudioMessage(
       ctx,
-      chatId,
+      chatIdNum,
       {
         fileId: v.file_id,
         fileUniqueId: v.file_unique_id,
@@ -392,14 +397,14 @@ export function registerMediaHandlers(
 
   bot.on(message("audio"), (ctx) => {
     if (!shouldRespond(ctx)) return;
-    const chatId = ctx.chat.id;
+    const chatIdNum = ctx.chat.id;
     const a = ctx.message.audio;
     const caption =
       typeof ctx.message.caption === "string" ? ctx.message.caption : "";
     const replyContext = buildReplyContext(ctx.message.reply_to_message);
     handleAudioMessage(
       ctx,
-      chatId,
+      chatIdNum,
       {
         fileId: a.file_id,
         fileUniqueId: a.file_unique_id,

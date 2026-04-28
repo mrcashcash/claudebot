@@ -1,7 +1,7 @@
 import { CronExpressionParser } from "cron-parser";
 import * as crons from "../state/crons.ts";
 import * as users from "../state/users.ts";
-import { fire, type RunnerDeps } from "./runner.ts";
+import { fire } from "./runner.ts";
 import { log, logError } from "../state/logger.ts";
 
 const TICK_MS = 60_000;
@@ -15,7 +15,7 @@ function bucketMinute(ms: number): number {
   return ms - (ms % 60_000);
 }
 
-async function tick(deps: RunnerDeps): Promise<void> {
+async function tick(): Promise<void> {
   if (running) {
     // Should never happen given our timing, but guard against re-entry.
     return;
@@ -45,10 +45,6 @@ async function tick(deps: RunnerDeps): Promise<void> {
         const lateMs = now - prevBucket;
         const withinCatchUp = !isCurrentMinute && lateMs <= CATCH_UP_MS;
         if (!isCurrentMinute && !withinCatchUp) {
-          // The slot is more than 30 minutes ago and we missed it — record so
-          // we don't keep checking it forever, but don't fire. For one-shot
-          // crons, drop them entirely instead of leaving a stale row that
-          // would refire on the next year/week match of the cron expression.
           if (c.oneShot) {
             await crons.remove(c.id);
             console.log(
@@ -63,6 +59,7 @@ async function tick(deps: RunnerDeps): Promise<void> {
             cronId: c.id,
             chatId: c.chatId,
             userId: c.userId,
+            transport: c.transport,
             lateMs,
             oneShotDeleted: c.oneShot === true,
           });
@@ -71,9 +68,7 @@ async function tick(deps: RunnerDeps): Promise<void> {
 
         // Reserve before dispatching so a slow persist doesn't get retried.
         await crons.update(c.id, { lastFiredAt: prevBucket });
-        fire(deps, c, isCurrentMinute ? 0 : lateMs);
-        // One-shot crons auto-delete after their first dispatch so a date-
-        // specific expression like "0 10 3 5 *" doesn't refire every year.
+        fire(c, isCurrentMinute ? 0 : lateMs);
         if (c.oneShot) {
           await crons.remove(c.id);
           console.log(`[cron] ${c.id} oneShot — deleted after fire`);
@@ -102,11 +97,11 @@ async function tick(deps: RunnerDeps): Promise<void> {
   }
 }
 
-export function start(deps: RunnerDeps): void {
+export function start(): void {
   if (handle) return;
   // Immediate first tick on boot for catch-up; then every minute.
-  void tick(deps);
-  handle = setInterval(() => void tick(deps), TICK_MS);
+  void tick();
+  handle = setInterval(() => void tick(), TICK_MS);
   console.log(
     `[cron] ticker started interval=${TICK_MS}ms catchUp=${CATCH_UP_MS / 60_000}min (tz is per-user)`,
   );

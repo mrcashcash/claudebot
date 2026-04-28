@@ -29,7 +29,7 @@ export interface AskClaudeOptions {
   permissionMode: PermissionMode;
   model?: string;
   canUseTool?: CanUseTool;
-  chatId?: number;
+  chatId?: string;
   attachments?: AskClaudeAttachment[];
   signal?: AbortSignal;
   /**
@@ -72,7 +72,7 @@ export class AskClaudeAbortedError extends Error {
   }
 }
 
-function buildHooks(chatId: number | undefined): Options["hooks"] {
+function buildHooks(chatId: string | undefined): Options["hooks"] {
   if (chatId === undefined) return undefined;
 
   const fireAndForget = (record: turnLog.TurnRecord): void => {

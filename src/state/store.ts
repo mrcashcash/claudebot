@@ -127,6 +127,9 @@ async function persistInternal(): Promise<void> {
   } catch {
     // ignore — next external-change check will tolerate the gap
   }
+  // On fresh installs the file didn't exist when watch() was first called, so
+  // it deferred. Now that we've created it, retry — watch() is idempotent.
+  if (!watcher) watch();
 }
 
 /**

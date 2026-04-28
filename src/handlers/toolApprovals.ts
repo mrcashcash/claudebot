@@ -1,4 +1,3 @@
-import { Markup, type Context } from "telegraf";
 import type {
   CanUseTool,
   PermissionResult,
@@ -6,7 +5,7 @@ import type {
 import * as sessions from "../state/sessions.ts";
 import * as approvals from "./approvals.ts";
 import * as questions from "./questions.ts";
-import type { TurnIO } from "./turnIO.ts";
+import type { ButtonGrid, TurnIO } from "./turnIO.ts";
 import { log, logError } from "../state/logger.ts";
 
 function inputSummary(input: Record<string, unknown>): string {
@@ -17,7 +16,6 @@ function inputSummary(input: Record<string, unknown>): string {
   }
 }
 
-const TELEGRAM_MAX_TEXT = 4096;
 const PROMPT_MAX = 3500;
 
 export type TriggerSource = "user" | "cron";
@@ -81,42 +79,17 @@ function formatToolPrompt(
   return truncate(lines.join("\n"), PROMPT_MAX);
 }
 
-export async function safeAnswerCbQuery(
-  ctx: Context,
-  text?: string,
-): Promise<void> {
-  try {
-    await ctx.answerCbQuery(text);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (
-      msg.includes("query is too old") ||
-      msg.includes("query ID is invalid")
-    ) {
-      const data =
-        ctx.callbackQuery && "data" in ctx.callbackQuery
-          ? ctx.callbackQuery.data
-          : "";
-      console.warn(
-        `[cb] answerCbQuery dropped (too old) chat=${ctx.chat?.id} data="${data}"`,
-      );
-      return;
-    }
-    console.warn("[cb] answerCallbackQuery failed:", msg);
-  }
-}
-
-function createPermissionKeyboard(toolUseId: string) {
-  return Markup.inlineKeyboard([
+function permissionButtons(toolUseId: string): ButtonGrid {
+  return [
     [
-      Markup.button.callback("✅ Allow", `perm:allow:once:${toolUseId}`),
-      Markup.button.callback("✅ Always", `perm:allow:always:${toolUseId}`),
+      { label: "✅ Allow", callbackId: `perm:allow:once:${toolUseId}` },
+      { label: "✅ Always", callbackId: `perm:allow:always:${toolUseId}` },
     ],
     [
-      Markup.button.callback("❌ Deny", `perm:deny:once:${toolUseId}`),
-      Markup.button.callback("❌ Never", `perm:deny:always:${toolUseId}`),
+      { label: "❌ Deny", callbackId: `perm:deny:once:${toolUseId}` },
+      { label: "❌ Never", callbackId: `perm:deny:always:${toolUseId}` },
     ],
-  ]);
+  ];
 }
 
 function ruleMatches(toolName: string, rules: string[] | undefined): boolean {
@@ -144,7 +117,7 @@ function isAskUserQuestionInput(
 
 export function buildCanUseTool(
   io: TurnIO,
-  chatId: number,
+  chatId: string,
   turnSignal: AbortSignal,
   triggerSource: TriggerSource = "user",
 ): CanUseTool {
@@ -293,16 +266,24 @@ export function buildCanUseTool(
     }
 
     const text = formatToolPrompt(toolName, input);
+    const buttons = permissionButtons(toolUseId);
+    let promptMessageId: string | undefined;
     try {
-      await io.reply(text, {
-        parse_mode: "Markdown",
-        ...createPermissionKeyboard(toolUseId),
-      });
-    } catch {
-      await io.reply(
-        text.replace(/[*_`]/g, ""),
-        createPermissionKeyboard(toolUseId),
-      );
+      const sent = await io.reply(text, { parseMode: "markdown", buttons });
+      promptMessageId = sent.messageId;
+    } catch (err) {
+      void logError("error.approval_send", err, { chatId, toolUseId });
+      // Last-ditch attempt — plain text.
+      try {
+        const sent = await io.reply(text.replace(/[*_`]/g, ""), { buttons });
+        promptMessageId = sent.messageId;
+      } catch {
+        // Bot can't send — auto-deny so the turn doesn't hang forever.
+        return {
+          behavior: "deny",
+          message: "Could not deliver the approval prompt.",
+        };
+      }
     }
     void log({
       category: "approval",
@@ -310,6 +291,7 @@ export function buildCanUseTool(
       chatId,
       tool: toolName,
       toolUseId,
+      messageId: promptMessageId,
       inputSummary: inputSummary(input),
     });
 
@@ -323,7 +305,7 @@ export function buildCanUseTool(
         } else {
           resolve({
             behavior: "deny",
-            message: "User denied this tool call via Telegram.",
+            message: "User denied this tool call.",
           });
         }
       });
@@ -343,28 +325,37 @@ export function buildCanUseTool(
   };
 }
 
-export async function handlePermissionCallback(
-  ctx: Context,
-  data: string,
-): Promise<boolean> {
+export interface PermissionVerdict {
+  decision: approvals.Decision;
+  scope: approvals.Scope;
+  toolUseId: string;
+  settled: boolean;
+  /** Short label suitable as a click toast / ephemeral confirm. */
+  toastLabel: string;
+  /** Markdown suffix appended to the prompt message after the user's choice. */
+  resolutionSuffix: string;
+}
+
+/**
+ * Parse a `perm:*` callback id, settle the matching approval, and return the
+ * verdict + UI-side strings the transport handler can use to update its
+ * message. Returns `null` when the callback id isn't a permission one.
+ *
+ * Telegram-specific UI actions (answer cbQuery, edit message via ctx) live in
+ * src/telegram/actions.ts; Slack-specific equivalents live in
+ * src/slack/actions.ts. Both call this function and then do their transport
+ * dance with the returned verdict.
+ */
+export function applyPermissionCallback(data: string): PermissionVerdict | null {
   const permMatch = data.match(/^perm:(allow|deny):(once|always):(.+)$/);
-  if (!permMatch) return false;
+  if (!permMatch) return null;
 
   const decision = permMatch[1] as approvals.Decision;
   const scope = permMatch[2] as approvals.Scope;
   const toolUseId = permMatch[3]!;
   const settled = approvals.settle(toolUseId, { decision, scope });
-  void log({
-    category: "approval",
-    event: "approval.decision",
-    chatId: ctx.chat?.id,
-    userId: ctx.from?.id,
-    toolUseId,
-    decision: scope === "always" ? `always_${decision}` : decision,
-    settled,
-  });
 
-  const cbLabel =
+  const toastLabel =
     decision === "allow"
       ? scope === "always"
         ? "Allowed (always)"
@@ -372,33 +363,21 @@ export async function handlePermissionCallback(
       : scope === "always"
         ? "Denied (always)"
         : "Denied";
-  await safeAnswerCbQuery(ctx, cbLabel);
-  try {
-    const suffix =
-      decision === "allow"
-        ? scope === "always"
-          ? "\n\n✅ *Allowed* (always for this chat)"
-          : "\n\n✅ *Allowed*"
-        : scope === "always"
-          ? "\n\n❌ *Denied* (always for this chat)"
-          : "\n\n❌ *Denied*";
-    const original =
-      ctx.callbackQuery?.message && "text" in ctx.callbackQuery.message
-        ? ctx.callbackQuery.message.text
-        : "";
-    await ctx.editMessageText(truncate(original + suffix, TELEGRAM_MAX_TEXT), {
-      parse_mode: "Markdown",
-    });
-  } catch {
-    try {
-      await ctx.editMessageReplyMarkup(undefined);
-    } catch {
-      // ignore
-    }
-  }
+  const resolutionSuffix =
+    decision === "allow"
+      ? scope === "always"
+        ? "\n\n✅ *Allowed* (always for this chat)"
+        : "\n\n✅ *Allowed*"
+      : scope === "always"
+        ? "\n\n❌ *Denied* (always for this chat)"
+        : "\n\n❌ *Denied*";
 
-  if (!settled) {
-    await ctx.reply("(That request already expired or was already answered.)");
-  }
-  return true;
+  return {
+    decision,
+    scope,
+    toolUseId,
+    settled,
+    toastLabel,
+    resolutionSuffix,
+  };
 }

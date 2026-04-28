@@ -1,14 +1,12 @@
 import type { Context } from "telegraf";
 import type { Message, MessageEntity } from "telegraf/types";
 import * as sessions from "../state/sessions.ts";
+import {
+  VALID_RESPOND_MODES,
+  type RespondMode,
+} from "../handlers/respondModes.ts";
 
-export type RespondMode = "always" | "mention" | "reply";
-
-export const VALID_RESPOND_MODES: ReadonlySet<RespondMode> = new Set([
-  "always",
-  "mention",
-  "reply",
-]);
+export { VALID_RESPOND_MODES, type RespondMode };
 
 /**
  * Decide whether the bot should respond to a message in this chat.

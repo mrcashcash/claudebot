@@ -2,6 +2,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { CronExpressionParser } from "cron-parser";
 import * as crons from "../state/crons.ts";
+import type { Transport } from "../state/crons.ts";
 import { log } from "../state/logger.ts";
 
 export const MAX_CRONS_PER_CHAT = 20;
@@ -17,13 +18,13 @@ export const MAX_CRONS_PER_CHAT = 20;
  */
 export function buildSchedulerSystemGuidance(
   tz: string,
-  userId: number,
+  userId: number | string,
   chatId: number | string,
+  isGroup: boolean,
 ): string {
-  const isGroup = String(chatId) !== String(userId);
   const scopeAdvice = isGroup
-    ? `This conversation is a Telegram group (chatId=${chatId}, userId=${userId}). \`workspaceDir\`, \`permissionMode\`, and \`model\` can be overridden per-chat — set in this group only — and that's almost always what the user wants when they say "switch my workspace" inside a group, since changing the user-layer setting would also change every other group/DM. Recommend the slash commands \`/workspace <path>\`, \`/mode <mode>\`, \`/model <alias>\` — they auto-write to the chat layer in groups. The \`sessions\` section of \`data/config.json\` is the live source of truth for chat-layer state, so prefer the slash commands over hand-editing it.`
-    : `This conversation is a Telegram DM (chatId === userId). Editing the \`users.${userId}\` block inside \`data/config.json\` is the right move for "switch my workspace / model / mode" requests here — the bot watches that file and reloads the next turn.`;
+    ? `This conversation is a group/channel (chatId=${chatId}, userId=${userId}). \`workspaceDir\`, \`permissionMode\`, and \`model\` can be overridden per-chat — set in this group only — and that's almost always what the user wants when they say "switch my workspace" inside a group, since changing the user-layer setting would also change every other group/DM. Recommend the slash commands \`/workspace <path>\`, \`/mode <mode>\`, \`/model <alias>\` — they auto-write to the chat layer in groups. The \`sessions\` section of \`data/config.json\` is the live source of truth for chat-layer state, so prefer the slash commands over hand-editing it.`
+    : `This conversation is a DM. Editing the \`users.${userId}\` block inside \`data/config.json\` is the right move for "switch my workspace / model / mode" requests here — the bot watches that file and reloads the next turn.`;
   return `When the user asks to be reminded about something at a future date/time, schedule it via the \`mcp__scheduler__cron_create\` tool (cron expression evaluated in ${tz}; pass \`oneShot: true\` for one-time reminders so the row auto-deletes after firing).
 
 Additionally, **if and only if** a Google Calendar MCP tool is available in this turn (look for tools whose name matches \`mcp__*calendar*__create_event\` or similar), AND the reminder is for a real-world calendar event — meeting, appointment, doctor visit, flight, dentist, interview, birthday, anniversary, deadline, class, hangout — also create a calendar event for it. Use the same date/time/timezone, put the user's phrasing as the event title, and put any context as the description.
@@ -37,9 +38,6 @@ Your per-user app config lives in \`data/config.json\` under the \`users.${userI
 ${scopeAdvice}`;
 }
 
-// The SDK's CallToolResult type has an index signature ([x: string]: unknown),
-// so a plain object literal works fine — we just don't bother declaring our
-// own intermediate interface.
 const ok = (text: string) => ({
   content: [{ type: "text" as const, text }],
 });
@@ -88,13 +86,18 @@ function describeCron(c: crons.Cron, tz: string): string {
 }
 
 /**
- * Builds a per-chat scheduler MCP server. chatId AND userId are captured by
- * closure: chatId so Claude cannot read or mutate another chat's jobs (list
- * filters by chatId, delete verifies the id belongs to the chat); userId so
- * the row records who owns the cron, which drives per-user config lookups
- * (TZ, workspace, mode) when the cron later fires.
+ * Builds a per-chat scheduler MCP server. chatId, userId, and transport are
+ * captured by closure so a fired cron is dispatched back to the same chat
+ * via the same transport — Claude can never read or mutate another chat's
+ * jobs by guessing an id (list filters by chatId, delete verifies the id
+ * belongs to the chat).
  */
-export function buildSchedulerMcp(chatId: number, userId: number, tz: string) {
+export function buildSchedulerMcp(
+  chatId: string,
+  userId: number | string,
+  tz: string,
+  transport: Transport,
+) {
   return createSdkMcpServer({
     name: "scheduler",
     version: "1.0.0",
@@ -140,6 +143,7 @@ export function buildSchedulerMcp(chatId: number, userId: number, tz: string) {
           const created = await crons.create({
             chatId,
             userId,
+            transport,
             cron,
             prompt,
             enabled: true,
@@ -153,6 +157,7 @@ export function buildSchedulerMcp(chatId: number, userId: number, tz: string) {
             chatId,
             userId,
             cronId: created.id,
+            transport,
             cron,
             prompt,
             resume: resume === true,

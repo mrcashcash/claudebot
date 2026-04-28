@@ -15,7 +15,7 @@ function ensureDir(): Promise<void> {
 export interface TurnRecord {
   ts: number;
   kind: "pre" | "post" | "post_failure";
-  chatId: number;
+  chatId: string;
   sessionId: string | undefined;
   toolUseID: string | undefined;
   tool: string;

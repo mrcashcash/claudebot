@@ -56,21 +56,24 @@ function assertLoaded(): void {
   if (!loaded) throw new Error("users.load() must be called before use");
 }
 
-export function get(userId: number): UserConfig | undefined {
-  assertLoaded();
-  return store.getUsers()[String(userId)];
+/** Stringify any user id so the same key works for Telegram numerics and Slack "U…". */
+function key(userId: number | string): string {
+  return String(userId);
 }
 
-export function has(userId: number): boolean {
+export function get(userId: number | string): UserConfig | undefined {
   assertLoaded();
-  return store.getUsers()[String(userId)] !== undefined;
+  return store.getUsers()[key(userId)];
 }
 
-export function allUserIds(): number[] {
+export function has(userId: number | string): boolean {
   assertLoaded();
-  return Object.keys(store.getUsers())
-    .map((s) => Number(s))
-    .filter((n) => Number.isInteger(n) && n > 0);
+  return store.getUsers()[key(userId)] !== undefined;
+}
+
+export function allUserIds(): string[] {
+  assertLoaded();
+  return Object.keys(store.getUsers());
 }
 
 async function readTemplate(): Promise<string> {
@@ -104,20 +107,20 @@ async function readTemplate(): Promise<string> {
  * Write a default config for the user if none exists. Returns true if we
  * actually created the entry, false if it was already present.
  */
-export async function ensure(userId: number): Promise<boolean> {
+export async function ensure(userId: number | string): Promise<boolean> {
   assertLoaded();
   const users = store.getUsers();
-  const key = String(userId);
-  if (users[key]) return false;
+  const k = key(userId);
+  if (users[k]) return false;
   const raw = await readTemplate();
   try {
-    users[key] = validateUserConfig(JSON.parse(raw));
+    users[k] = validateUserConfig(JSON.parse(raw));
   } catch (err) {
     void logError("error.user_template", err, { userId });
     console.warn(
       `[users] template was invalid for user ${userId}: ${err instanceof Error ? err.message : String(err)}`,
     );
-    users[key] = {};
+    users[k] = {};
   }
   await store.persist();
   console.log(`[users] created default config for user ${userId}`);
@@ -125,30 +128,30 @@ export async function ensure(userId: number): Promise<boolean> {
 }
 
 export async function update(
-  userId: number,
+  userId: number | string,
   patch: Partial<UserConfig>,
 ): Promise<void> {
   assertLoaded();
   const users = store.getUsers();
-  const key = String(userId);
-  const current = users[key] ?? {};
+  const k = key(userId);
+  const current = users[k] ?? {};
   // Merge: undefined in `patch` clears the field; otherwise overrides.
   const next: UserConfig = { ...current };
-  for (const k of Object.keys(patch) as (keyof UserConfig)[]) {
-    const v = patch[k];
+  for (const fk of Object.keys(patch) as (keyof UserConfig)[]) {
+    const v = patch[fk];
     if (v === undefined) {
-      delete next[k];
+      delete next[fk];
     } else {
       // Deliberate any-cast: TS can't narrow Partial<UserConfig> per-key here.
-      (next as Record<string, unknown>)[k] = v;
+      (next as Record<string, unknown>)[fk] = v;
     }
   }
-  users[key] = next;
+  users[k] = next;
   await store.persist();
 }
 
-export function voiceFor(userId: number): VoiceConfig {
-  const u = store.getUsers()[String(userId)];
+export function voiceFor(userId: number | string): VoiceConfig {
+  const u = store.getUsers()[key(userId)];
   const v = u?.voice ?? {};
   const tIn = v.tts ?? {};
   const tts: TtsConfig = {
@@ -178,22 +181,22 @@ export function voiceFor(userId: number): VoiceConfig {
  */
 export function effectiveWorkspace(
   chatId: number | string,
-  userId: number,
+  userId: number | string,
   gatewayDir: string,
 ): string {
   const chatOverride = sessions.get(chatId).workspaceDir;
   if (chatOverride) return chatOverride;
-  return store.getUsers()[String(userId)]?.workspaceDir ?? gatewayDir;
+  return store.getUsers()[key(userId)]?.workspaceDir ?? gatewayDir;
 }
 
 export function effectiveMode(
   chatId: number | string,
-  userId: number,
+  userId: number | string,
 ): PermissionMode {
   const chatOverride = sessions.get(chatId).permissionMode;
   if (chatOverride) return chatOverride;
   return (
-    store.getUsers()[String(userId)]?.permissionMode ?? DEFAULT_PERMISSION_MODE
+    store.getUsers()[key(userId)]?.permissionMode ?? DEFAULT_PERMISSION_MODE
   );
 }
 
@@ -203,16 +206,16 @@ export function effectiveMode(
  */
 export function effectiveModel(
   chatId: number | string,
-  userId: number,
+  userId: number | string,
 ): string | undefined {
   const chatOverride = sessions.get(chatId).model;
   if (chatOverride) return chatOverride;
-  const u = store.getUsers()[String(userId)]?.model;
+  const u = store.getUsers()[key(userId)]?.model;
   return u && u.length > 0 ? u : undefined;
 }
 
-export function tzFor(userId: number): string {
-  return store.getUsers()[String(userId)]?.tz ?? DEFAULT_TZ;
+export function tzFor(userId: number | string): string {
+  return store.getUsers()[key(userId)]?.tz ?? DEFAULT_TZ;
 }
 
 export function watch(): void {

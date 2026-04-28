@@ -11,8 +11,8 @@ export interface LogRecord {
   category: LogCategory;
   event: string;
   level?: "info" | "warn" | "error";
-  chatId?: number;
-  userId?: number;
+  chatId?: string;
+  userId?: number | string;
   sessionId?: string;
   [key: string]: unknown;
 }
@@ -66,7 +66,11 @@ export async function log(rec: LogRecord): Promise<void> {
     const trimmed = trimRecord(rec);
     const line =
       JSON.stringify({ ts: Date.now(), level: "info", ...trimmed }) + "\n";
-    await fs.appendFile(path.join(LOG_DIR, `${todayLocal()}.jsonl`), line, "utf8");
+    await fs.appendFile(
+      path.join(LOG_DIR, `${todayLocal()}.jsonl`),
+      line,
+      "utf8",
+    );
   } catch (err) {
     console.warn("[logger] write failed:", err);
   }

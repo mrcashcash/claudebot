@@ -1,18 +1,16 @@
 import type { TurnIO } from "./turnIO.ts";
 
-const TELEGRAM_MAX_TEXT = 4096;
+const STREAM_HARD_CAP = 4000;
 const STREAM_HEAD_LIMIT = 4000;
 const STREAM_DEBOUNCE_MS = 700;
 
 /**
- * Live-streams Claude's reply into a single Telegram message by editing it as
+ * Live-streams Claude's reply into a single transport message by editing it as
  * text accumulates. The placeholder is created lazily on the first push so
  * turns that never produce text (tool-only) don't leave an empty message.
  *
- * Telegram rate-limits message edits at ~1/sec for the same message; the
- * 700ms debounce keeps us comfortably below that. Edits run serially — if
- * one is still in flight when the next debounce fires, the next one is
- * skipped (the latest text wins on the *following* tick).
+ * The TurnIO abstraction handles "message is not modified" silently, so this
+ * module doesn't need to know the underlying transport's quirks.
  */
 export interface StreamingReply {
   /** Update the live preview with the current accumulated text. */
@@ -25,18 +23,8 @@ export interface StreamingReply {
   hasPlaceholder(): boolean;
 }
 
-function isNotModifiedError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const e = err as { description?: unknown; message?: unknown; response?: { description?: unknown } };
-  const candidates = [e.response?.description, e.description, e.message];
-  for (const c of candidates) {
-    if (typeof c === "string" && /not modified/i.test(c)) return true;
-  }
-  return false;
-}
-
 export function createStreamingReply(io: TurnIO): StreamingReply {
-  let placeholderId: number | undefined;
+  let placeholderId: string | undefined;
   let pendingText = "";
   let lastShownText = "";
   let editScheduled: NodeJS.Timeout | null = null;
@@ -45,8 +33,9 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
   let creating: Promise<void> | null = null;
   // One-shot give-up: if the placeholder send fails (chat blocked, rate limit,
   // bot kicked from group, …) further pushes mustn't keep retrying — Claude
-  // streams text every few hundred ms and we'd flood Telegram with failing
-  // sends. finalize() still does its own send in the no-placeholder branch.
+  // streams text every few hundred ms and we'd flood the transport with
+  // failing sends. finalize() still does its own send in the no-placeholder
+  // branch.
   let placeholderFailed = false;
 
   async function ensurePlaceholder(): Promise<void> {
@@ -59,7 +48,7 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
     creating = (async () => {
       try {
         const sent = await io.reply("…");
-        placeholderId = sent.message_id;
+        placeholderId = sent.messageId;
       } catch (err) {
         placeholderFailed = true;
         console.warn(
@@ -84,18 +73,11 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
         ? snapshot.slice(0, STREAM_HEAD_LIMIT) + "\n\n…"
         : snapshot;
     try {
-      await io.telegram.editMessageText(
-        io.chatId,
-        placeholderId,
-        undefined,
-        text,
-      );
+      await io.editMessage(placeholderId, text);
       lastShownText = snapshot;
     } catch (err) {
-      if (!isNotModifiedError(err)) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn("[stream] edit failed:", msg);
-      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[stream] edit failed:", msg);
     } finally {
       editInFlight = false;
       lastEditAt = Date.now();
@@ -136,25 +118,15 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
     const first = parts[0] ?? "";
     if (placeholderId !== undefined) {
       try {
-        await io.telegram.editMessageText(
-          io.chatId,
-          placeholderId,
-          undefined,
-          first.slice(0, TELEGRAM_MAX_TEXT),
-        );
-      } catch (err) {
-        // "message is not modified" fires whenever the streamed preview
-        // already matches the final text (the common case for short replies)
-        // — treat that as success, otherwise we'd send a duplicate.
-        if (!isNotModifiedError(err)) {
-          await io.reply(first.slice(0, TELEGRAM_MAX_TEXT));
-        }
+        await io.editMessage(placeholderId, first.slice(0, STREAM_HARD_CAP));
+      } catch {
+        await io.reply(first.slice(0, STREAM_HARD_CAP));
       }
     } else {
-      await io.reply(first.slice(0, TELEGRAM_MAX_TEXT));
+      await io.reply(first.slice(0, STREAM_HARD_CAP));
     }
     for (const part of parts.slice(1)) {
-      await io.reply(part.slice(0, TELEGRAM_MAX_TEXT));
+      await io.reply(part.slice(0, STREAM_HARD_CAP));
     }
   }
 
@@ -162,18 +134,13 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
     await settle();
     if (placeholderId !== undefined) {
       try {
-        await io.telegram.editMessageText(
-          io.chatId,
-          placeholderId,
-          undefined,
-          text.slice(0, TELEGRAM_MAX_TEXT),
-        );
+        await io.editMessage(placeholderId, text.slice(0, STREAM_HARD_CAP));
         return;
       } catch {
         // fall through to reply
       }
     }
-    await io.reply(text.slice(0, TELEGRAM_MAX_TEXT));
+    await io.reply(text.slice(0, STREAM_HARD_CAP));
   }
 
   function hasPlaceholder(): boolean {

@@ -60,6 +60,15 @@ export const VALID_VOICE_REPLY_MODES: ReadonlySet<VoiceReplyMode> = new Set([
   "auto",
 ]);
 
+export interface SlackConfig {
+  /** Bot token (xoxb-…). */
+  botToken: string;
+  /** App-level token with `connections:write` for Socket Mode (xapp-…). */
+  appToken: string;
+  /** Slack user IDs (U…) allowed to talk to the bot. */
+  allowedUserIds: Set<string>;
+}
+
 export interface Config {
   telegramBotToken: string;
   allowedUserIds: Set<number>;
@@ -71,6 +80,10 @@ export interface Config {
    * user has overridden their workspace to somewhere else.
    */
   gatewayDir: string;
+  /** Optional Slack transport. Absent (undefined) means Slack is disabled and
+   *  the bot runs Telegram-only. Present means we also start a Slack Bolt
+   *  app in Socket Mode at boot. */
+  slack?: SlackConfig;
 }
 
 export const VALID_PERMISSION_MODES: ReadonlySet<PermissionMode> = new Set([
@@ -120,13 +133,33 @@ function parseUserIds(raw: string): Set<number> {
   return new Set(ids);
 }
 
+function parseSlackConfig(): SlackConfig | undefined {
+  const botToken = process.env.SLACK_BOT_TOKEN?.trim();
+  const appToken = process.env.SLACK_APP_TOKEN?.trim();
+  const allowedRaw = process.env.ALLOWED_SLACK_USER_IDS?.trim();
+  // All three must be present together. If any are missing, leave Slack off.
+  if (!botToken || !appToken || !allowedRaw) return undefined;
+  const allowedUserIds = new Set(
+    allowedRaw
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+  if (allowedUserIds.size === 0) {
+    throw new Error("ALLOWED_SLACK_USER_IDS must contain at least one Slack user id");
+  }
+  return { botToken, appToken, allowedUserIds };
+}
+
 export function loadConfig(): Config {
   const telegramBotToken = required("TELEGRAM_BOT_TOKEN");
   const allowedUserIds = parseUserIds(required("ALLOWED_TELEGRAM_USER_IDS"));
   const gatewayDir = path.resolve(process.cwd());
+  const slack = parseSlackConfig();
   return {
     telegramBotToken,
     allowedUserIds,
     gatewayDir,
+    ...(slack ? { slack } : {}),
   };
 }

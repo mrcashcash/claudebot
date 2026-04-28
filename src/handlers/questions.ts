@@ -1,5 +1,4 @@
-import { Markup } from "telegraf";
-import type { TurnIO } from "./turnIO.ts";
+import type { ButtonGrid, TurnIO } from "./turnIO.ts";
 
 export interface QuestionOption {
   label: string;
@@ -15,12 +14,12 @@ export interface QuestionDef {
 
 interface ActiveSession {
   requestId: string;
-  chatId: number;
+  chatId: string;
   questions: QuestionDef[];
   answers: Record<string, string>;
   currentIndex: number;
   toggled: Set<number>;
-  messageId: number | undefined;
+  messageId: string | undefined;
   io: TurnIO;
   resolve: (answers: Record<string, string>) => void;
   cancelled: boolean;
@@ -34,30 +33,30 @@ function ellipsize(s: string, max = MAX_LABEL): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "…";
 }
 
-function buildKeyboard(s: ActiveSession): ReturnType<typeof Markup.inlineKeyboard> {
+function buildButtons(s: ActiveSession): ButtonGrid {
   const q = s.questions[s.currentIndex]!;
-  const rows = q.options.map((opt, idx) => {
+  const rows: ButtonGrid = q.options.map((opt, idx) => {
     const prefix = q.multiSelect
       ? s.toggled.has(idx)
         ? "✓ "
         : "○ "
       : "";
     return [
-      Markup.button.callback(
-        prefix + ellipsize(opt.label),
-        `q:${s.requestId}:${s.currentIndex}:opt:${idx}`,
-      ),
+      {
+        label: prefix + ellipsize(opt.label),
+        callbackId: `q:${s.requestId}:${s.currentIndex}:opt:${idx}`,
+      },
     ];
   });
   if (q.multiSelect) {
     rows.push([
-      Markup.button.callback(
-        "✅ Done",
-        `q:${s.requestId}:${s.currentIndex}:done`,
-      ),
+      {
+        label: "✅ Done",
+        callbackId: `q:${s.requestId}:${s.currentIndex}:done`,
+      },
     ]);
   }
-  return Markup.inlineKeyboard(rows);
+  return rows;
 }
 
 function questionText(s: ActiveSession): string {
@@ -75,61 +74,24 @@ function questionText(s: ActiveSession): string {
 
 async function renderCurrent(s: ActiveSession): Promise<void> {
   const text = questionText(s);
-  const kb = buildKeyboard(s);
-  try {
-    if (s.messageId !== undefined) {
-      await s.io.telegram.editMessageText(
-        s.chatId,
-        s.messageId,
-        undefined,
-        text,
-        { parse_mode: "Markdown", ...kb },
-      );
-    } else {
-      const sent = await s.io.telegram.sendMessage(s.chatId, text, {
-        parse_mode: "Markdown",
-        ...kb,
-      });
-      s.messageId = sent.message_id;
-    }
-  } catch {
-    // Markdown failure → plain
-    const plain = text.replace(/[*_`]/g, "");
-    if (s.messageId !== undefined) {
-      try {
-        await s.io.telegram.editMessageText(
-          s.chatId,
-          s.messageId,
-          undefined,
-          plain,
-          kb,
-        );
-      } catch {
-        // ignore
-      }
-    } else {
-      const sent = await s.io.telegram.sendMessage(s.chatId, plain, kb);
-      s.messageId = sent.message_id;
-    }
+  const buttons = buildButtons(s);
+  if (s.messageId !== undefined) {
+    await s.io.editMessage(s.messageId, text, {
+      parseMode: "markdown",
+      buttons,
+    });
+  } else {
+    const sent = await s.io.reply(text, { parseMode: "markdown", buttons });
+    s.messageId = sent.messageId;
   }
 }
 
 async function finalizeMessage(s: ActiveSession, summary: string): Promise<void> {
   if (s.messageId === undefined) return;
   try {
-    await s.io.telegram.editMessageText(
-      s.chatId,
-      s.messageId,
-      undefined,
-      summary,
-      { parse_mode: "Markdown" },
-    );
+    await s.io.editMessage(s.messageId, summary, { parseMode: "markdown" });
   } catch {
-    try {
-      await s.io.telegram.editMessageReplyMarkup(s.chatId, s.messageId, undefined, undefined);
-    } catch {
-      // ignore
-    }
+    await s.io.removeButtons(s.messageId);
   }
 }
 
@@ -178,13 +140,11 @@ export async function ask(
       active.delete(requestId);
       s.cancelled = true;
       if (s.messageId !== undefined) {
-        void s.io.telegram
-          .editMessageText(
-            s.chatId,
+        void s.io
+          .editMessage(
             s.messageId,
-            undefined,
             "❓ _(question cancelled — turn superseded)_",
-            { parse_mode: "Markdown" },
+            { parseMode: "markdown" },
           )
           .catch(() => {});
       }
