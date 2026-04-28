@@ -105,7 +105,19 @@ export function getSessions(): Record<string, ChatState> {
   return cfg.sessions;
 }
 
-export async function persist(): Promise<void> {
+// Serialize all writes through a single tail Promise: concurrent callers
+// (e.g. onSessionId persisting a sessionId while runTurn persists totalCostUsd)
+// would otherwise race the writeFile→rename pair, with one rename hitting an
+// already-renamed TMP and erroring or losing data.
+let persistTail: Promise<void> = Promise.resolve();
+
+export function persist(): Promise<void> {
+  const next = persistTail.then(() => persistInternal());
+  persistTail = next.catch(() => {});
+  return next;
+}
+
+async function persistInternal(): Promise<void> {
   await ensureDir();
   await fs.writeFile(TMP, JSON.stringify(cfg, null, 2), "utf8");
   await fs.rename(TMP, FILE);

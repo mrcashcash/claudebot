@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Config } from "../config.ts";
 import type { AskClaudeAttachment } from "../services/claude.ts";
+import type { KickOffFromCtxOptions } from "../bot.ts";
 import * as users from "../state/users.ts";
 import { transcribeAudio } from "../services/voice/index.ts";
 import { logError } from "../state/logger.ts";
@@ -31,9 +32,7 @@ export interface MediaHandlerDeps {
     ctx: Context,
     chatId: number,
     prompt: string,
-    attachments?: AskClaudeAttachment[],
-    traceStart?: number,
-    inputWasVoice?: boolean,
+    opts?: KickOffFromCtxOptions,
   ) => void;
 }
 
@@ -78,21 +77,40 @@ export function registerMediaHandlers(
 
   const pendingAlbums = new Map<string, PendingAlbum>();
 
+  /** Build the image-attachment shape and fire a turn. */
+  function dispatchImages(
+    ctx: Context,
+    chatId: number,
+    replyContext: string,
+    caption: string,
+    attachments: AskClaudeAttachment[],
+  ): void {
+    const count = attachments.length;
+    const body =
+      caption.length > 0
+        ? caption
+        : count === 1
+          ? "Describe this image."
+          : `Describe these ${count} images.`;
+    kickOffTurn(ctx, chatId, replyContext + body, { attachments });
+  }
+
+  function buildImageAttachment(
+    mediaType: string,
+    buf: Buffer,
+  ): AskClaudeAttachment {
+    return { type: "image", mediaType, base64: buf.toString("base64") };
+  }
+
   function dispatchAlbum(groupId: string): void {
     const album = pendingAlbums.get(groupId);
     pendingAlbums.delete(groupId);
     if (!album || album.attachments.length === 0) return;
-    const count = album.attachments.length;
-    const body =
-      album.caption.length > 0
-        ? album.caption
-        : count === 1
-          ? "Describe this image."
-          : `Describe these ${count} images.`;
-    kickOffTurn(
+    dispatchImages(
       album.ctxAny,
       album.chatId,
-      album.replyContext + body,
+      album.replyContext,
+      album.caption,
       album.attachments,
     );
   }
@@ -145,15 +163,10 @@ export function registerMediaHandlers(
       }
       return;
     }
-    const attachment: AskClaudeAttachment = {
-      type: "image",
-      mediaType: "image/jpeg",
-      base64: buf.toString("base64"),
-    };
+    const attachment = buildImageAttachment("image/jpeg", buf);
 
     if (!groupId) {
-      const body = caption.length > 0 ? caption : "Describe this image.";
-      kickOffTurn(ctx, chatId, replyContext + body, [attachment]);
+      dispatchImages(ctx, chatId, replyContext, caption, [attachment]);
       return;
     }
 
@@ -198,13 +211,9 @@ export function registerMediaHandlers(
           );
           return;
         }
-        const body = caption.length > 0 ? caption : "Describe this image.";
-        const attachment: AskClaudeAttachment = {
-          type: "image",
-          mediaType: mime,
-          base64: buf.toString("base64"),
-        };
-        kickOffTurn(ctx, chatId, replyContext + body, [attachment]);
+        dispatchImages(ctx, chatId, replyContext, caption, [
+          buildImageAttachment(mime, buf),
+        ]);
         return;
       }
 
@@ -328,7 +337,10 @@ export function registerMediaHandlers(
           replyContext +
           `[User sent a ${audio.durationSec}s ${audio.kind} message. Transcript:]\n${transcript}` +
           (caption ? `\n\n[Caption: ${caption}]` : "");
-        kickOffTurn(ctx, chatId, prompt, undefined, tArrival, true);
+        kickOffTurn(ctx, chatId, prompt, {
+          traceStart: tArrival,
+          inputWasVoice: true,
+        });
       } catch (err) {
         void logError("error.media", err, {
           kind: audio.kind,

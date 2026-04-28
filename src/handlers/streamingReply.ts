@@ -25,6 +25,16 @@ export interface StreamingReply {
   hasPlaceholder(): boolean;
 }
 
+function isNotModifiedError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { description?: unknown; message?: unknown; response?: { description?: unknown } };
+  const candidates = [e.response?.description, e.description, e.message];
+  for (const c of candidates) {
+    if (typeof c === "string" && /not modified/i.test(c)) return true;
+  }
+  return false;
+}
+
 export function createStreamingReply(io: TurnIO): StreamingReply {
   let placeholderId: number | undefined;
   let pendingText = "";
@@ -33,9 +43,15 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
   let editInFlight = false;
   let lastEditAt = 0;
   let creating: Promise<void> | null = null;
+  // One-shot give-up: if the placeholder send fails (chat blocked, rate limit,
+  // bot kicked from group, …) further pushes mustn't keep retrying — Claude
+  // streams text every few hundred ms and we'd flood Telegram with failing
+  // sends. finalize() still does its own send in the no-placeholder branch.
+  let placeholderFailed = false;
 
   async function ensurePlaceholder(): Promise<void> {
     if (placeholderId !== undefined) return;
+    if (placeholderFailed) return;
     if (creating) {
       await creating;
       return;
@@ -45,8 +61,9 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
         const sent = await io.reply("…");
         placeholderId = sent.message_id;
       } catch (err) {
+        placeholderFailed = true;
         console.warn(
-          "[stream] placeholder send failed:",
+          "[stream] placeholder send failed (giving up for this turn):",
           err instanceof Error ? err.message : String(err),
         );
       } finally {
@@ -75,8 +92,8 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
       );
       lastShownText = snapshot;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/not modified/i.test(msg)) {
+      if (!isNotModifiedError(err)) {
+        const msg = err instanceof Error ? err.message : String(err);
         console.warn("[stream] edit failed:", msg);
       }
     } finally {
@@ -129,8 +146,7 @@ export function createStreamingReply(io: TurnIO): StreamingReply {
         // "message is not modified" fires whenever the streamed preview
         // already matches the final text (the common case for short replies)
         // — treat that as success, otherwise we'd send a duplicate.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!/not modified/i.test(msg)) {
+        if (!isNotModifiedError(err)) {
           await io.reply(first.slice(0, TELEGRAM_MAX_TEXT));
         }
       }

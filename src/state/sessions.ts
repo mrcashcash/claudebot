@@ -34,3 +34,25 @@ export async function update(
   sessions[key] = { ...(sessions[key] ?? {}), ...patch };
   await store.persist();
 }
+
+/**
+ * Atomically append a tool name to allowAlwaysTools / denyAlwaysTools. The
+ * read-and-merge happens synchronously (no awaits between get and write), so
+ * two concurrent "Always" clicks on different tools can't both observe the
+ * same prior list and clobber each other. Idempotent.
+ */
+export async function addAlwaysRule(
+  chatId: number | string,
+  decision: "allow" | "deny",
+  toolName: string,
+): Promise<void> {
+  assertLoaded();
+  const sessions = store.getSessions();
+  const key = String(chatId);
+  const current = sessions[key] ?? {};
+  const field = decision === "allow" ? "allowAlwaysTools" : "denyAlwaysTools";
+  const existing = current[field] ?? [];
+  if (existing.includes(toolName)) return;
+  sessions[key] = { ...current, [field]: [...existing, toolName] };
+  await store.persist();
+}

@@ -316,18 +316,7 @@ export function buildCanUseTool(
     return await new Promise<PermissionResult>((resolve) => {
       approvals.register(toolUseId, async (choice) => {
         if (choice.scope === "always") {
-          const fresh = sessions.get(chatId);
-          if (choice.decision === "allow") {
-            const next = Array.from(
-              new Set([...(fresh.allowAlwaysTools ?? []), toolName]),
-            );
-            await sessions.update(chatId, { allowAlwaysTools: next });
-          } else {
-            const next = Array.from(
-              new Set([...(fresh.denyAlwaysTools ?? []), toolName]),
-            );
-            await sessions.update(chatId, { denyAlwaysTools: next });
-          }
+          await sessions.addAlwaysRule(chatId, choice.decision, toolName);
         }
         if (choice.decision === "allow") {
           resolve({ behavior: "allow", updatedInput: input });

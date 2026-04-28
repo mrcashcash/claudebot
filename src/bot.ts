@@ -117,6 +117,20 @@ function startTypingLoop(io: TurnIO): () => void {
   };
 }
 
+/**
+ * Public-facing opts object used by Telegraf-handler callbacks (commands +
+ * media handlers) to feed a turn into `kickOffTurnFromContext`. A subset of
+ * `KickOffOptions` — handlers don't pick `triggerSource`/`persistSession`,
+ * those are scheduler-only knobs.
+ */
+export interface KickOffFromCtxOptions {
+  attachments?: AskClaudeAttachment[];
+  /** Wall-clock anchor (ms since epoch) for upstream latency tracing. */
+  traceStart?: number;
+  /** True when the originating user message was a voice/audio note. */
+  inputWasVoice?: boolean;
+}
+
 export interface KickOffOptions {
   attachments?: AskClaudeAttachment[];
   /** Wall-clock anchor (ms since epoch) for upstream latency tracing. */
@@ -251,13 +265,12 @@ export function buildBot(config: Config): BuiltBot {
     ctx: Context,
     chatId: number,
     prompt: string,
-    attachments?: AskClaudeAttachment[],
-    traceStart?: number,
-    inputWasVoice?: boolean,
+    opts: KickOffFromCtxOptions = {},
   ): void {
     const userId = userIdFromCtx(ctx);
     if (userId === undefined) return; // auth middleware already rejected
     const io = ioFromContext(ctx);
+    const { attachments, traceStart, inputWasVoice } = opts;
     kickOffTurn(io, chatId, userId, prompt, {
       ...(attachments ? { attachments } : {}),
       ...(traceStart !== undefined ? { traceStart } : {}),
@@ -331,7 +344,6 @@ export function buildBot(config: Config): BuiltBot {
     const controller = new AbortController();
     turnControllers.set(chatId, controller);
 
-    const state = sessions.get(chatId);
     const stopTyping = startTypingLoop(io);
     const canUseTool = buildCanUseTool(io, chatId, controller.signal, triggerSource);
     const stream = createStreamingReply(io);
@@ -343,7 +355,9 @@ export function buildBot(config: Config): BuiltBot {
     const promptPreview = prompt.slice(0, 80).replace(/\s+/g, " ");
     // When persistSession is false (cron fresh-session), force a new SDK session
     // by not passing resumeSessionId. Otherwise reuse the chat's stored session.
-    const resumeSessionId = persistSession ? state.sessionId : undefined;
+    const resumeSessionId = persistSession
+      ? sessions.get(chatId).sessionId
+      : undefined;
     const sessionTag = resumeSessionId ? resumeSessionId.slice(0, 8) : "new";
     const attachTag =
       opts.attachments && opts.attachments.length > 0
@@ -356,7 +370,7 @@ export function buildBot(config: Config): BuiltBot {
     console.log(
       `[turn] start chat=${chatId} user=${userId} session=${sessionTag} model=${modelTag} mode=${modeTag}${attachTag}${triggerTag} prompt="${promptPreview}${prompt.length > 80 ? "…" : ""}"`,
     );
-    const cwdResolved = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+    const cwd = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
     void log({
       category: "turn",
       event: "turn.start",
@@ -365,7 +379,7 @@ export function buildBot(config: Config): BuiltBot {
       sessionId: resumeSessionId,
       model: modelTag,
       permissionMode: modeTag,
-      workspace: cwdResolved,
+      workspace: cwd,
       source: triggerSource,
       persistSession,
     });
@@ -374,7 +388,6 @@ export function buildBot(config: Config): BuiltBot {
       const tAskStart = Date.now();
       const tz = users.tzFor(userId);
       const schedulerServer = buildSchedulerMcp(chatId, userId, tz);
-      const cwd = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
       // Always expose <gatewayDir>/.claude/skills/ to the turn, even when the
       // chat has overridden its workspace. The SDK loads .claude/skills/ from
       // additionalDirectories per the skills docs. Skip when cwd already is
@@ -451,15 +464,20 @@ export function buildBot(config: Config): BuiltBot {
         }
       }
       const claudeMs = Date.now() - tAskStart;
+      // Re-read fresh state: data/config.json may have been edited mid-turn
+      // (Claude itself can Edit/Write it, or onSessionId already wrote a new
+      // sessionId), so the snapshot we'd read at turn-start is potentially
+      // stale by now.
+      const fresh = sessions.get(chatId);
       if (persistSession) {
         await sessions.update(chatId, {
-          sessionId: reply.sessionId || state.sessionId,
-          totalCostUsd: (state.totalCostUsd ?? 0) + reply.costUsd,
+          sessionId: reply.sessionId || fresh.sessionId,
+          totalCostUsd: (fresh.totalCostUsd ?? 0) + reply.costUsd,
         });
       } else {
         // Still tally cost — the user is paying for it.
         await sessions.update(chatId, {
-          totalCostUsd: (state.totalCostUsd ?? 0) + reply.costUsd,
+          totalCostUsd: (fresh.totalCostUsd ?? 0) + reply.costUsd,
         });
       }
 
@@ -632,10 +650,19 @@ export function buildBot(config: Config): BuiltBot {
           ),
         ),
       );
-      const deadline = Date.now() + SHUTDOWN_DRAIN_MS;
-      while (inFlightChats.size > 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 500));
-      }
+      // Race the per-chat tail Promises (oldest-first FIFO chain — when the
+      // tail resolves, every queued turn has finished) against the drain
+      // deadline. The tails are allSettled so one failure can't reject the
+      // whole drain.
+      const tailsSnapshot = [...turnTails.values()];
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      await new Promise<void>((resolve) => {
+        timeoutHandle = setTimeout(resolve, SHUTDOWN_DRAIN_MS);
+        void Promise.allSettled(tailsSnapshot).then(() => {
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          resolve();
+        });
+      });
       if (inFlightChats.size > 0) {
         void log({
           category: "lifecycle",
