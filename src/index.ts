@@ -39,6 +39,7 @@ async function main(): Promise<void> {
   await users.load();
   users.watch();
   await crons.load();
+  crons.watch();
   await sweepOldLogs(30);
   await busy.reset();
   keepalive.start();
@@ -127,6 +128,7 @@ async function main(): Promise<void> {
     // Stop the scheduler first so no new cron fires during the drain window.
     cronTicker.stop();
     users.stopWatch();
+    crons.stopWatch();
     engine.beginShutdown();
 
     const inFlight = engine.inFlightChats();

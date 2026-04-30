@@ -1,6 +1,7 @@
 import type { App } from "@slack/bolt";
 import type { Config } from "../config.ts";
 import * as users from "../state/users.ts";
+import { seedDefaultCronsIfMissing } from "../state/seedDefaultCrons.ts";
 import { ioFromSlack } from "./io.ts";
 import { dispatchSlackCommand } from "./commands.ts";
 import { logError } from "../state/logger.ts";
@@ -69,6 +70,9 @@ export function registerSlackEvents(app: App, deps: SlackEventDeps): void {
     const text = e.text ?? "";
     if (!userId || !channelId) return;
     if (!(await authorize(config, userId))) return;
+    await seedDefaultCronsIfMissing(channelId, userId, "slack").catch((err) => {
+      void logError("error.seed_default_crons", err, { userId });
+    });
 
     const io = ioFromSlack(client, channelId, "dm");
     if (text.startsWith("/")) {

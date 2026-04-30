@@ -3,6 +3,7 @@ import { message } from "telegraf/filters";
 import type { Config } from "../config.ts";
 import type { AskClaudeAttachment } from "../services/claude.ts";
 import * as users from "../state/users.ts";
+import { seedDefaultCronsIfMissing } from "../state/seedDefaultCrons.ts";
 import { ioFromContext, ioFromTelegram } from "./io.ts";
 import { COMMAND_MENU, registerCommands } from "./commands.ts";
 import { registerMediaHandlers } from "./mediaHandlers.ts";
@@ -84,6 +85,16 @@ export function buildTelegramApp(
       void logError("error.users_ensure", err, { userId });
       console.warn(`[users] ensure(${userId}) failed:`, err);
     });
+    if (ctx.chat?.type === "private") {
+      await seedDefaultCronsIfMissing(
+        String(ctx.chat.id),
+        userId,
+        "telegram",
+      ).catch((err) => {
+        void logError("error.seed_default_crons", err, { userId });
+        console.warn(`[crons] seedDefaultCronsIfMissing failed:`, err);
+      });
+    }
     await next();
   });
 
