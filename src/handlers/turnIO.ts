@@ -56,4 +56,14 @@ export interface TurnIO {
    *  support is a follow-up — calling these on a Slack IO is a no-op. */
   sendVoice?(audio: Buffer, filename: string): Promise<void>;
   sendAudio?(audio: Buffer, filename: string): Promise<void>;
+
+  /** Send a local file to the chat as a document attachment. Used by the
+   *  send-file MCP tool. Implementations are responsible for transport-specific
+   *  size limits — Telegram's cloud Bot API caps sendDocument at 50 MB so the
+   *  Telegram impl chunks larger files; Slack files.uploadV2 supports up to
+   *  1 GB so a single upload is fine there. */
+  sendDocument(
+    filePath: string,
+    opts?: { caption?: string },
+  ): Promise<{ chunks: number }>;
 }
