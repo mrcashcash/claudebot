@@ -4,7 +4,7 @@ import type { TurnEngine } from "../core/turnEngine.ts";
 import { registerSlackActions } from "./actions.ts";
 import { registerSlackEvents } from "./handlers.ts";
 import { ioFromSlack } from "./io.ts";
-import { registerTransport } from "../scheduler/transport.ts";
+import { registerTransport, registerNotify } from "../scheduler/transport.ts";
 import type { ChatKind } from "../handlers/turnIO.ts";
 import { logError } from "../state/logger.ts";
 
@@ -56,6 +56,15 @@ export async function buildSlackApp(
     engine.kickOffTurn(io, chatId, userId, prompt, opts);
   });
 
+  const notifyChat = async (chatId: string, text: string): Promise<void> => {
+    try {
+      await app.client.chat.postMessage({ channel: chatId, text });
+    } catch {
+      // ignore — channel may have been left or archived
+    }
+  };
+  registerNotify("slack", notifyChat);
+
   registerSlackEvents(app, {
     config,
     bootTime,
@@ -83,12 +92,6 @@ export async function buildSlackApp(
         void logError("error.slack_stop", err);
       }
     },
-    async notifyChat(chatId: string, text: string) {
-      try {
-        await app.client.chat.postMessage({ channel: chatId, text });
-      } catch {
-        // ignore — channel may have been left or archived
-      }
-    },
+    notifyChat,
   };
 }
