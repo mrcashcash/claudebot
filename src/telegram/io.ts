@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { Context, Telegraf } from "telegraf";
 import type {
   ButtonGrid,
@@ -9,6 +11,13 @@ import type {
 type TelegramClient = Telegraf["telegram"];
 
 const TELEGRAM_MAX_TEXT = 4096;
+
+// Telegram cloud Bot API caps sendDocument at 50 MB. For 50–100 MB files we
+// split into ~49 MB chunks (the upper guidance bound, with HTTP/multipart
+// overhead headroom). A self-hosted Bot API server would lift this to 2 GB
+// but the gateway doesn't run one.
+const TELEGRAM_DOC_MAX_BYTES = 50 * 1024 * 1024;
+const TELEGRAM_CHUNK_BYTES = 49 * 1024 * 1024;
 
 function isNotModifiedError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
@@ -123,6 +132,48 @@ function buildTelegramIO(
     },
     async sendAudio(audio, filename) {
       await telegram.sendAudio(chatIdNum, { source: audio, filename });
+    },
+    async sendDocument(filePath, opts) {
+      const stat = await fs.stat(filePath);
+      const totalBytes = stat.size;
+      const baseName = path.basename(filePath);
+      if (totalBytes <= TELEGRAM_DOC_MAX_BYTES) {
+        const buf = await fs.readFile(filePath);
+        await telegram.sendDocument(
+          chatIdNum,
+          { source: buf, filename: baseName },
+          opts?.caption ? { caption: opts.caption } : {},
+        );
+        return { chunks: 1 };
+      }
+      // Split into ~49 MB pieces. Each piece is sent as <name>.partNN-of-MM
+      // so the user can `cat` / `copy /b` them back together in order.
+      const totalChunks = Math.ceil(totalBytes / TELEGRAM_CHUNK_BYTES);
+      const pad = String(totalChunks).length;
+      const handle = await fs.open(filePath, "r");
+      try {
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * TELEGRAM_CHUNK_BYTES;
+          const len = Math.min(TELEGRAM_CHUNK_BYTES, totalBytes - start);
+          const buf = Buffer.alloc(len);
+          await handle.read(buf, 0, len, start);
+          const idx = String(i + 1).padStart(pad, "0");
+          const totalStr = String(totalChunks).padStart(pad, "0");
+          const partName = `${baseName}.part${idx}-of-${totalStr}`;
+          const caption =
+            i === 0
+              ? `${opts?.caption ? opts.caption + "\n\n" : ""}📎 ${baseName} split into ${totalChunks} parts (${(totalBytes / 1024 / 1024).toFixed(1)} MB total). Reassemble: \`cat ${baseName}.part*\` (Linux/Mac) or \`copy /b ${baseName}.part01-of-${totalStr}+...+${baseName}.part${totalStr}-of-${totalStr} ${baseName}\` (Windows).`
+              : `part ${idx}/${totalStr}`;
+          await telegram.sendDocument(
+            chatIdNum,
+            { source: buf, filename: partName },
+            { caption },
+          );
+        }
+      } finally {
+        await handle.close();
+      }
+      return { chunks: totalChunks };
     },
   };
 }

@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { WebClient, Block, KnownBlock } from "@slack/web-api";
 import type {
   ButtonGrid,
@@ -111,5 +113,22 @@ export function ioFromSlack(
     },
     // No sendVoice / sendAudio: Slack TTS support is intentionally deferred.
     // bot.ts checks for the optional methods before calling, so we omit them.
+    async sendDocument(filePath, opts) {
+      // Slack files.uploadV2 supports up to 1 GB so single-shot is fine for
+      // anything the send-file MCP tool admits (capped at 100 MB by the tool).
+      const buf = await fs.readFile(filePath);
+      const filename = path.basename(filePath);
+      const args: Record<string, unknown> = {
+        channel_id: channelId,
+        file: buf,
+        filename,
+      };
+      if (opts?.caption) args.initial_comment = opts.caption;
+      if (threadTs) args.thread_ts = threadTs;
+      await client.files.uploadV2(
+        args as unknown as Parameters<typeof client.files.uploadV2>[0],
+      );
+      return { chunks: 1 };
+    },
   };
 }

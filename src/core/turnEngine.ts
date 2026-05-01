@@ -20,6 +20,10 @@ import {
   buildSchedulerMcp,
   buildSchedulerSystemGuidance,
 } from "../scheduler/mcp.ts";
+import {
+  buildSendFileMcp,
+  buildSendFileSystemGuidance,
+} from "../services/sendFileMcp.ts";
 import { log, logError } from "../state/logger.ts";
 
 const CHUNK_SIZE = 3500;
@@ -278,6 +282,7 @@ export function buildTurnEngine(config: Config): TurnEngine {
       const tAskStart = Date.now();
       const tz = users.tzFor(userId);
       const schedulerServer = buildSchedulerMcp(chatId, userId, tz, io.transport);
+      const sendFileServer = buildSendFileMcp(io, cwd);
       const additionalDirectories =
         cwd === config.gatewayDir ? undefined : [config.gatewayDir];
       const baseAsk = {
@@ -287,13 +292,16 @@ export function buildTurnEngine(config: Config): TurnEngine {
         canUseTool,
         chatId,
         signal: controller.signal,
-        mcpServers: { scheduler: schedulerServer },
-        appendSystemPrompt: buildSchedulerSystemGuidance(
-          tz,
-          userId,
-          chatId,
-          io.chatKind === "group",
-        ),
+        mcpServers: { scheduler: schedulerServer, claudebot: sendFileServer },
+        appendSystemPrompt:
+          buildSchedulerSystemGuidance(
+            tz,
+            userId,
+            chatId,
+            io.chatKind === "group",
+          ) +
+          "\n\n" +
+          buildSendFileSystemGuidance(io.transport),
         ...(additionalDirectories ? { additionalDirectories } : {}),
         onTextDelta: (_delta: string, full: string) => stream.push(full),
         onSessionId: async (sid: string) => {
