@@ -21,6 +21,13 @@ export interface Cron {
   resume: boolean;
   oneShot?: boolean;
   description?: string;
+  /**
+   * If set, the cron fires an in-process system task (registered in
+   * `scheduler/systemTasks.ts`) instead of dispatching `prompt` to Claude.
+   * `prompt` is ignored for system-task crons; the task posts its own result
+   * via the transport's notifyChat.
+   */
+  systemTask?: string;
 }
 
 type Store = Record<string, Cron>;
@@ -76,6 +83,9 @@ function parseStore(raw: unknown): Store {
       ...(o.oneShot === true ? { oneShot: true } : {}),
       ...(typeof o.description === "string"
         ? { description: o.description }
+        : {}),
+      ...(typeof o.systemTask === "string" && o.systemTask.length > 0
+        ? { systemTask: o.systemTask }
         : {}),
     };
   }

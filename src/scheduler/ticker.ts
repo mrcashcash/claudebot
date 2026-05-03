@@ -38,6 +38,11 @@ async function tick(): Promise<void> {
         const prevMs = it.prev().toDate().getTime();
         const prevBucket = bucketMinute(prevMs);
 
+        // A cron's first scheduled fire may be in the future; if prev() returns
+        // a match from before this cron existed (e.g. a date-specific one-shot
+        // whose only earlier match is last year), that's not a missed slot.
+        if (prevBucket < bucketMinute(c.createdAt)) continue;
+
         // Already fired this slot — idempotent.
         if (c.lastFiredAt !== undefined && c.lastFiredAt >= prevBucket) continue;
 

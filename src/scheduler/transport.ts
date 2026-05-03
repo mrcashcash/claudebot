@@ -28,3 +28,19 @@ export function getTransportKickOff(
 export function transportNames(): Transport[] {
   return [...registry.keys()];
 }
+
+/**
+ * Per-transport notify implementation, used by system-task crons that post
+ * a result message directly without going through the Claude turn pipeline.
+ */
+export type Notify = (chatId: string, text: string) => Promise<void>;
+
+const notifyRegistry = new Map<Transport, Notify>();
+
+export function registerNotify(name: Transport, fn: Notify): void {
+  notifyRegistry.set(name, fn);
+}
+
+export function getNotify(name: Transport): Notify | undefined {
+  return notifyRegistry.get(name);
+}

@@ -12,7 +12,8 @@ import type { RestartChat, Transport } from "./state/restart-marker.ts";
 import * as busy from "./lifecycle/busy.ts";
 import * as keepalive from "./lifecycle/keepalive.ts";
 import * as cronTicker from "./scheduler/ticker.ts";
-import { registerTransport } from "./scheduler/transport.ts";
+import { registerTransport, registerNotify } from "./scheduler/transport.ts";
+import "./scheduler/systemTasks.ts";
 import { log, logError, sweepOldLogs } from "./state/logger.ts";
 
 process.on("unhandledRejection", (err) => {
@@ -69,6 +70,7 @@ async function main(): Promise<void> {
   // from a Telegram chat dispatch through this entry. The Slack transport
   // registers itself inside buildSlackApp.
   registerTransport("telegram", tg.kickOffTurnFromCron);
+  registerNotify("telegram", tg.notifyChat);
 
   await tg.setMyCommands();
 
