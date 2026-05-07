@@ -93,7 +93,10 @@ export function registerMediaHandlers(
         : count === 1
           ? "Describe this image."
           : `Describe these ${count} images.`;
-    kickOffTurn(ctx, chatId, replyContext + body, { attachments });
+    kickOffTurn(ctx, chatId, replyContext + body, {
+      attachments,
+      recordAsLast: true,
+    });
   }
 
   function buildImageAttachment(
@@ -236,7 +239,7 @@ export function registerMediaHandlers(
         `User uploaded a file at \`${rel}\` (mime: ${mime}, ${buf.byteLength} bytes).` +
         (caption ? `\nCaption: ${caption}` : "") +
         `\nUse Read or another appropriate tool to inspect it.`;
-      kickOffTurn(ctx, chatId, replyContext + body);
+      kickOffTurn(ctx, chatId, replyContext + body, { recordAsLast: true });
     } catch (err) {
       void logError("error.media", err, {
         kind: "document",
@@ -345,6 +348,7 @@ export function registerMediaHandlers(
         kickOffTurn(ctx, chatId, prompt, {
           traceStart: tArrival,
           inputWasVoice: true,
+          recordAsLast: true,
         });
       } catch (err) {
         void logError("error.media", err, {

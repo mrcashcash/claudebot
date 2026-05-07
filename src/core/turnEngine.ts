@@ -53,6 +53,13 @@ export interface KickOffOptions {
    * reply as a voice message. Defaults to false.
    */
   inputWasVoice?: boolean;
+  /**
+   * Persist `prompt` as `ChatState.lastPrompt` so `/redo` can re-fire it.
+   * Set true at user-message entry points; left false for cron, `/init`,
+   * `/compact`, and other system-originated turns so they can't clobber a
+   * real user prompt.
+   */
+  recordAsLast?: boolean;
 }
 
 /**
@@ -195,6 +202,14 @@ export function buildTurnEngine(config: Config): TurnEngine {
       attachments: opts.attachments?.length ?? 0,
       transport: io.transport,
     });
+    if (opts.recordAsLast && triggerSource === "user") {
+      void sessions.update(chatId, { lastPrompt: prompt }).catch((err) => {
+        void logError("error.turn_tail", err, {
+          chatId,
+          phase: "record_last_prompt",
+        });
+      });
+    }
     const prev = turnTailsMap.get(chatId) ?? Promise.resolve();
     const next = prev.then(() =>
       runTurn(io, chatId, userId, prompt, opts).catch((err) => {

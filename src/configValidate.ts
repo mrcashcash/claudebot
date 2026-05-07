@@ -107,7 +107,11 @@ export interface UserConfig {
   tz?: string;
   name?: string;
   notes?: string;
+  /** Named workspace shortcuts: `name → absolute path`. Managed via /ws. */
+  bookmarks?: Record<string, string>;
 }
+
+export const BOOKMARK_NAME_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 
 function pickString(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -201,6 +205,28 @@ export function validateUserConfig(raw: unknown): UserConfig {
       if (Object.keys(tts).length > 0) voice.tts = tts;
     }
     if (Object.keys(voice).length > 0) out.voice = voice;
+  }
+
+  if (obj.bookmarks !== undefined && obj.bookmarks !== null) {
+    if (typeof obj.bookmarks !== "object" || Array.isArray(obj.bookmarks)) {
+      throw new Error("bookmarks must be an object of name → path");
+    }
+    const bookmarks: Record<string, string> = {};
+    for (const [name, value] of Object.entries(
+      obj.bookmarks as Record<string, unknown>,
+    )) {
+      if (!BOOKMARK_NAME_RE.test(name)) {
+        throw new Error(
+          `bookmarks key "${name}" must match ${BOOKMARK_NAME_RE} (alphanumeric, underscore, hyphen; up to 32 chars)`,
+        );
+      }
+      const path = pickString(value);
+      if (!path) {
+        throw new Error(`bookmarks["${name}"] must be a non-empty string`);
+      }
+      bookmarks[name] = path;
+    }
+    if (Object.keys(bookmarks).length > 0) out.bookmarks = bookmarks;
   }
 
   return out;

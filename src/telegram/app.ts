@@ -28,6 +28,10 @@ export interface KickOffFromCtxOptions {
   traceStart?: number;
   /** True when the originating user message was a voice/audio note. */
   inputWasVoice?: boolean;
+  /** Persist this prompt as `ChatState.lastPrompt` so `/redo` can re-fire it.
+   *  Set true at user-message entry points (text, photo, doc, voice); leave
+   *  false for command-fired turns like `/init` and `/compact`. */
+  recordAsLast?: boolean;
 }
 
 export interface TelegramApp {
@@ -107,11 +111,12 @@ export function buildTelegramApp(
     const userId = ctx.from?.id;
     if (userId === undefined) return; // auth middleware already rejected
     const io = ioFromContext(ctx);
-    const { attachments, traceStart, inputWasVoice } = opts;
+    const { attachments, traceStart, inputWasVoice, recordAsLast } = opts;
     engine.kickOffTurn(io, chatId, userId, prompt, {
       ...(attachments ? { attachments } : {}),
       ...(traceStart !== undefined ? { traceStart } : {}),
       ...(inputWasVoice ? { inputWasVoice: true } : {}),
+      ...(recordAsLast ? { recordAsLast: true } : {}),
     });
   }
 
@@ -130,7 +135,7 @@ export function buildTelegramApp(
     if (text.startsWith("/")) return;
     if (!shouldRespond(ctx)) return;
     const prompt = buildReplyContext(ctx.message.reply_to_message) + text;
-    kickOffTurnFromContext(ctx, chatId, prompt);
+    kickOffTurnFromContext(ctx, chatId, prompt, { recordAsLast: true });
   });
 
   function kickOffTurnFromCron(

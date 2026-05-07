@@ -6,6 +6,7 @@ import { ioFromSlack } from "./io.ts";
 import { dispatchSlackCommand } from "./commands.ts";
 import { logError } from "../state/logger.ts";
 import type { TurnIO } from "../handlers/turnIO.ts";
+import type { KickOffOptions } from "../core/turnEngine.ts";
 
 export interface SlackEventDeps {
   config: Config;
@@ -18,6 +19,7 @@ export interface SlackEventDeps {
     chatId: string,
     userId: number | string,
     prompt: string,
+    opts?: KickOffOptions,
   ) => void;
   abortTurn: (chatId: string, reason?: string) => boolean;
 }
@@ -92,7 +94,7 @@ export function registerSlackEvents(app: App, deps: SlackEventDeps): void {
       if (handled) return;
     }
     if (text.trim().length === 0) return;
-    kickOffTurn(io, channelId, userId, text);
+    kickOffTurn(io, channelId, userId, text, { recordAsLast: true });
   });
 
   // Channel mentions: bot is invited to a channel and someone @-mentions it.
@@ -137,6 +139,6 @@ export function registerSlackEvents(app: App, deps: SlackEventDeps): void {
       await io.reply("Mention me with a question — e.g. `@claude what files are in this workspace?`");
       return;
     }
-    kickOffTurn(io, channelId, userId, stripped);
+    kickOffTurn(io, channelId, userId, stripped, { recordAsLast: true });
   });
 }

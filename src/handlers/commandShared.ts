@@ -85,6 +85,10 @@ export const COMMAND_MENU = [
     description: "Set Claude's working directory for this chat",
   },
   {
+    command: "ws",
+    description: "Manage named workspace bookmarks (list/save/use/delete)",
+  },
+  {
     command: "cloudexpert",
     description: "Quick set workspace to D:\\cloudexpert",
   },
@@ -106,6 +110,7 @@ export const COMMAND_MENU = [
     description: "Stop the current Claude turn (keeps session)",
   },
   { command: "cost", description: "Show cumulative cost for this chat" },
+  { command: "redo", description: "Re-run your last message" },
   {
     command: "rules",
     description: "List always-allow / always-deny tool rules",

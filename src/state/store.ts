@@ -26,6 +26,13 @@ export interface ChatState {
    * requires a reply to a bot message. DMs ignore this and always respond.
    */
   respondTo?: "always" | "mention" | "reply";
+  /**
+   * Last user-typed prompt for this chat — captured by `kickOffTurn` when
+   * called with `recordAsLast: true`. Powers `/redo`. Cron, `/init`, and
+   * `/compact` deliberately skip the capture so they can't clobber a real
+   * user message.
+   */
+  lastPrompt?: string;
 }
 
 export interface AppConfig {

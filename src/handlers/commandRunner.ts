@@ -13,6 +13,7 @@ import {
 import * as sessions from "../state/sessions.ts";
 import * as users from "../state/users.ts";
 import * as crons from "../state/crons.ts";
+import { BOOKMARK_NAME_RE } from "../configValidate.ts";
 import {
   COMMAND_MENU,
   MODE_ALIASES,
@@ -411,6 +412,160 @@ async function cmdVoice(deps: CommandDeps, args: string[]): Promise<void> {
   await reply(deps, `✅ Voice reply mode set to *${next}* as your default.${note}`);
 }
 
+async function cmdRedo(deps: CommandDeps): Promise<void> {
+  const last = sessions.get(deps.chatId).lastPrompt;
+  if (!last || last.trim().length === 0) {
+    await reply(
+      deps,
+      "No previous message to re-run. Send a message first, then `/redo` re-fires it.",
+      false,
+    );
+    return;
+  }
+  await reply(deps, `↻ Re-running: _${escMd(previewPrompt(last, 120))}_`);
+  deps.kickOff(last);
+}
+
+async function cmdWs(deps: CommandDeps, args: string[]): Promise<void> {
+  const { config, chatId, userId, chatKind } = deps;
+  if (chatKind === "group") {
+    await reply(
+      deps,
+      "Bookmarks are personal — DM me to manage them. In groups, use `/workspace <path>`.",
+      false,
+    );
+    return;
+  }
+  const sub = (args[0] ?? "list").toLowerCase();
+  const u = users.get(userId);
+  const bookmarks = { ...(u?.bookmarks ?? {}) };
+
+  if (sub === "" || sub === "list" || sub === "ls") {
+    const names = Object.keys(bookmarks).sort();
+    if (names.length === 0) {
+      await reply(
+        deps,
+        "No bookmarks yet.\n" +
+          "`/ws save <name>` — save the current workspace under a name\n" +
+          "`/ws save <name> <path>` — save a specific path\n" +
+          "`/ws use <name>` — switch to a saved bookmark\n" +
+          "`/ws delete <name>` — remove a bookmark",
+      );
+      return;
+    }
+    const current = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+    const lines = [`*${names.length} bookmark(s)*:`, ""];
+    for (const name of names) {
+      const p = bookmarks[name]!;
+      const marker = p === current ? " ← current" : "";
+      lines.push(`• \`${name}\` → \`${p}\`${marker}`);
+    }
+    lines.push("");
+    lines.push("`/ws use <name>` · `/ws save <name> [path]` · `/ws delete <name>`");
+    await reply(deps, lines.join("\n"));
+    return;
+  }
+
+  if (sub === "save") {
+    const name = args[1];
+    if (!name) {
+      await reply(
+        deps,
+        "Usage: `/ws save <name> [path]` — path defaults to the current workspace.",
+        false,
+      );
+      return;
+    }
+    if (!BOOKMARK_NAME_RE.test(name)) {
+      await reply(
+        deps,
+        `❌ Invalid name "${name}". Use letters, digits, underscore, or hyphen (up to 32 chars).`,
+        false,
+      );
+      return;
+    }
+    const rawPath = args.slice(2).join(" ").trim();
+    const target = rawPath
+      ? path.resolve(rawPath)
+      : users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+    try {
+      const stat = await fs.stat(target);
+      if (!stat.isDirectory()) {
+        await reply(deps, `❌ Not a directory: \`${target}\``, false);
+        return;
+      }
+    } catch {
+      await reply(deps, `❌ Path does not exist: \`${target}\``, false);
+      return;
+    }
+    bookmarks[name] = target;
+    await users.update(userId, { bookmarks });
+    await reply(deps, `🔖 Saved bookmark \`${name}\` → \`${target}\`.`);
+    return;
+  }
+
+  if (sub === "use") {
+    const name = args[1];
+    if (!name) {
+      await reply(deps, "Usage: `/ws use <name>`", false);
+      return;
+    }
+    const target = bookmarks[name];
+    if (!target) {
+      await reply(deps, `No bookmark named \`${name}\`. Try \`/ws list\`.`);
+      return;
+    }
+    try {
+      const stat = await fs.stat(target);
+      if (!stat.isDirectory()) {
+        await reply(
+          deps,
+          `❌ Bookmark \`${name}\` points at \`${target}\` which is no longer a directory. Re-save it.`,
+          false,
+        );
+        return;
+      }
+    } catch {
+      await reply(
+        deps,
+        `❌ Bookmark \`${name}\` points at \`${target}\` which no longer exists. Re-save it.`,
+        false,
+      );
+      return;
+    }
+    const scope = await writeOverride(chatKind, chatId, userId, {
+      workspaceDir: target,
+    });
+    await reply(
+      deps,
+      `✅ Workspace set to \`${target}\` (\`${name}\`) ${scopeNote(scope)}.`,
+    );
+    return;
+  }
+
+  if (sub === "delete" || sub === "rm" || sub === "del") {
+    const name = args[1];
+    if (!name) {
+      await reply(deps, "Usage: `/ws delete <name>`", false);
+      return;
+    }
+    if (!(name in bookmarks)) {
+      await reply(deps, `No bookmark named \`${name}\`.`);
+      return;
+    }
+    delete bookmarks[name];
+    await users.update(userId, { bookmarks });
+    await reply(deps, `🗑️ Removed bookmark \`${name}\`.`, false);
+    return;
+  }
+
+  await reply(
+    deps,
+    `Unknown subcommand "${sub}". Use list / save / use / delete.`,
+    false,
+  );
+}
+
 async function cmdCron(deps: CommandDeps, args: string[]): Promise<void> {
   const { chatId } = deps;
   const sub = (args[0] ?? "list").toLowerCase();
@@ -524,6 +679,9 @@ export async function runCommand(
     case "workspace":
       await cmdWorkspace(deps, args);
       return true;
+    case "ws":
+      await cmdWs(deps, args);
+      return true;
     case "cloudexpert":
       await cmdCloudexpert(deps);
       return true;
@@ -563,6 +721,9 @@ export async function runCommand(
       await reply(deps, `💰 Cumulative cost for this chat: $${cost.toFixed(4)}`, false);
       return true;
     }
+    case "redo":
+      await cmdRedo(deps);
+      return true;
     case "rules":
       await cmdRules(deps, args);
       return true;
