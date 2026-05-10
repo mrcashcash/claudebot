@@ -100,7 +100,10 @@ export const COMMAND_MENU = [
     command: "compact",
     description: "Summarize and continue from a compact form",
   },
-  { command: "resume", description: "Resume a specific session id" },
+  {
+    command: "resume",
+    description: "List/pick a recent session for this workspace",
+  },
   {
     command: "new",
     description: "Start a fresh Claude session (keeps tool rules)",

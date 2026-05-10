@@ -13,6 +13,11 @@ import {
 import * as sessions from "../state/sessions.ts";
 import * as users from "../state/users.ts";
 import * as crons from "../state/crons.ts";
+import {
+  findSessionByPrefix,
+  listSessions,
+  projectsDirFor,
+} from "../services/claudeSessions.ts";
 import { BOOKMARK_NAME_RE } from "../configValidate.ts";
 import {
   COMMAND_MENU,
@@ -270,29 +275,98 @@ async function cmdCloudexpert(deps: CommandDeps): Promise<void> {
   await reply(deps, `✅ Workspace set to \`${target}\` ${scopeNote(scope)}.`);
 }
 
+function ageString(mtimeMs: number, now = Date.now()): string {
+  const sec = Math.max(0, Math.floor((now - mtimeMs) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
+
 async function cmdResume(deps: CommandDeps, args: string[]): Promise<void> {
-  const { chatId } = deps;
+  const { chatId, userId, config } = deps;
   const arg = args.join(" ").trim();
+  const argLower = arg.toLowerCase();
   const state = sessions.get(chatId);
+  const ws = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+
   if (!arg) {
-    const current = state.sessionId ?? "(none)";
-    await reply(
-      deps,
-      `Current session: \`${current}\`\nUsage: /resume <sessionId>\nOr: /resume reset`,
-    );
+    const list = await listSessions(ws, 5);
+    const lines: string[] = [];
+    const current = state.sessionId;
+    if (current) {
+      lines.push(`*Current session:* \`${current}\``);
+      lines.push(`Resume in CLI: \`claude --resume ${current}\``);
+    } else {
+      lines.push("*Current session:* _(none)_");
+    }
+    lines.push("");
+    if (list.length === 0) {
+      lines.push(`No sessions found in \`${projectsDirFor(ws)}\`.`);
+    } else {
+      lines.push(`*Recent sessions* for \`${ws}\`:`);
+      for (const s of list) {
+        const marker = s.id === current ? " ← current" : "";
+        const head = `• \`${s.id.slice(0, 8)}\` (${ageString(s.mtimeMs)})${marker}`;
+        if (s.preview) {
+          lines.push(`${head}\n  _${escMd(previewPrompt(s.preview, 80))}_`);
+        } else {
+          lines.push(head);
+        }
+      }
+    }
+    lines.push("");
+    lines.push("Usage: `/resume <id-or-prefix>` · `/resume latest` · `/resume reset`");
+    await reply(deps, lines.join("\n"));
     return;
   }
-  if (arg === "reset") {
+
+  if (argLower === "reset") {
     await sessions.update(chatId, { sessionId: undefined });
     await reply(deps, "✅ Session cleared.", false);
     return;
   }
-  if (!/^[0-9a-fA-F-]{8,}$/.test(arg)) {
-    await reply(deps, "❌ That doesn't look like a session id.", false);
+
+  if (argLower === "latest" || argLower === "host") {
+    const list = await listSessions(ws, 1);
+    const top = list[0];
+    if (!top) {
+      await reply(
+        deps,
+        `❌ No sessions found in \`${projectsDirFor(ws)}\`. Nothing to resume.`,
+      );
+      return;
+    }
+    await sessions.update(chatId, { sessionId: top.id });
+    await reply(
+      deps,
+      `↪ Will resume \`${top.id}\` (${ageString(top.mtimeMs)}) on your next message.`,
+    );
     return;
   }
-  await sessions.update(chatId, { sessionId: arg });
-  await reply(deps, `✅ Will resume session \`${arg}\` on next message.`);
+
+  if (!/^[0-9a-f-]{4,}$/i.test(arg)) {
+    await reply(deps, "❌ That doesn't look like a session id or prefix.", false);
+    return;
+  }
+
+  const resolved = await findSessionByPrefix(ws, arg);
+  if (resolved === "ambiguous") {
+    await reply(
+      deps,
+      `❌ Prefix \`${arg}\` matches more than one session. Use more characters.`,
+    );
+    return;
+  }
+  if (!resolved) {
+    await reply(deps, `❌ No session matching \`${arg}\` in this workspace.`);
+    return;
+  }
+  await sessions.update(chatId, { sessionId: resolved });
+  await reply(deps, `↪ Will resume \`${resolved}\` on your next message.`);
 }
 
 async function cmdRules(deps: CommandDeps, args: string[]): Promise<void> {
