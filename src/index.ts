@@ -15,14 +15,19 @@ import * as cronTicker from "./scheduler/ticker.ts";
 import { registerTransport, registerNotify } from "./scheduler/transport.ts";
 import "./scheduler/systemTasks.ts";
 import { log, logError, sweepOldLogs } from "./state/logger.ts";
+import * as instanceLock from "./state/instanceLock.ts";
 
 process.on("unhandledRejection", (err) => {
   void logError("error.uncaught_rejection", err);
   console.error("[unhandledRejection]", err);
 });
 process.on("uncaughtException", (err) => {
-  void logError("error.uncaught_exception", err);
   console.error("[uncaughtException]", err);
+  // The "exit" handler registered by instanceLock.acquire() will release the
+  // lock synchronously. Don't keep running after an uncaught exception —
+  // a zombie process would race a fresh instance on the same bot tokens.
+  // Await the log write before exit; process.exit doesn't drain async I/O.
+  logError("error.uncaught_exception", err).finally(() => process.exit(1));
 });
 
 /** Tag a chat id by its likely transport. Telegram chat ids parse as
@@ -35,6 +40,16 @@ const SHUTDOWN_DRAIN_MS = 30 * 60 * 1000; // 30 minutes max
 
 async function main(): Promise<void> {
   const config = loadConfig();
+
+  const transports: string[] = ["telegram"];
+  if (config.slack) transports.push("slack");
+  try {
+    instanceLock.acquire(transports);
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+  }
+
   await store.load();
   await sessions.load();
   await users.load();
@@ -231,6 +246,7 @@ async function main(): Promise<void> {
     });
 
     keepalive.stop();
+    instanceLock.release();
     process.exit(0);
   };
 
