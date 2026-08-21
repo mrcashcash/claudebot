@@ -87,6 +87,24 @@ export function parsePositiveInt(
   return n;
 }
 
+export function parsePositiveNumber(raw: unknown, name: string): number {
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${name} must be a positive number; got: ${String(raw)}`);
+  }
+  return n;
+}
+
+/**
+ * Spend ceilings. `monthlyUsd` is enforced against a per-chat month bucket
+ * (`ChatState.monthUsd`); `perTurnUsd` is handed to the SDK as `maxBudgetUsd`
+ * so a runaway turn stops itself mid-flight. Absent = unlimited.
+ */
+export interface UserBudgetConfig {
+  monthlyUsd?: number;
+  perTurnUsd?: number;
+}
+
 /**
  * Voice config as it's stored on disk: every field optional, including a
  * partial TTS sub-config. `voiceFor` in users.ts merges this with defaults
@@ -109,6 +127,13 @@ export interface UserConfig {
   notes?: string;
   /** Named workspace shortcuts: `name → absolute path`. Managed via /ws. */
   bookmarks?: Record<string, string>;
+  /** Spend ceilings. Managed via /budget. */
+  budget?: UserBudgetConfig;
+  /**
+   * How many background tasks (`/bg`) may run at once for this user.
+   * Defaults to `TASK_CONCURRENCY_DEFAULT` in core/taskRunner.ts.
+   */
+  maxConcurrentTasks?: number;
 }
 
 export const BOOKMARK_NAME_RE = /^[a-zA-Z0-9_-]{1,32}$/;
@@ -205,6 +230,29 @@ export function validateUserConfig(raw: unknown): UserConfig {
       if (Object.keys(tts).length > 0) voice.tts = tts;
     }
     if (Object.keys(voice).length > 0) out.voice = voice;
+  }
+
+  if (obj.budget !== undefined && obj.budget !== null) {
+    if (typeof obj.budget !== "object" || Array.isArray(obj.budget)) {
+      throw new Error("budget must be an object");
+    }
+    const b = obj.budget as Record<string, unknown>;
+    const budget: UserBudgetConfig = {};
+    if (b.monthlyUsd !== undefined && b.monthlyUsd !== null && b.monthlyUsd !== "") {
+      budget.monthlyUsd = parsePositiveNumber(b.monthlyUsd, "budget.monthlyUsd");
+    }
+    if (b.perTurnUsd !== undefined && b.perTurnUsd !== null && b.perTurnUsd !== "") {
+      budget.perTurnUsd = parsePositiveNumber(b.perTurnUsd, "budget.perTurnUsd");
+    }
+    if (Object.keys(budget).length > 0) out.budget = budget;
+  }
+
+  if (obj.maxConcurrentTasks !== undefined && obj.maxConcurrentTasks !== null && obj.maxConcurrentTasks !== "") {
+    out.maxConcurrentTasks = parsePositiveInt(
+      obj.maxConcurrentTasks,
+      2,
+      "maxConcurrentTasks",
+    );
   }
 
   if (obj.bookmarks !== undefined && obj.bookmarks !== null) {

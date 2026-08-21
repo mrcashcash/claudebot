@@ -7,6 +7,11 @@ import * as store from "./state/store.ts";
 import * as sessions from "./state/sessions.ts";
 import * as users from "./state/users.ts";
 import * as crons from "./state/crons.ts";
+import * as taskStore from "./state/tasks.ts";
+import * as taskRunner from "./core/taskRunner.ts";
+import * as watcherStore from "./state/watchers.ts";
+import * as watcherTicker from "./watchers/ticker.ts";
+import { ioFor } from "./core/ioRegistry.ts";
 import * as restartMarker from "./state/restart-marker.ts";
 import type { RestartChat, Transport } from "./state/restart-marker.ts";
 import * as busy from "./lifecycle/busy.ts";
@@ -56,6 +61,8 @@ async function main(): Promise<void> {
   users.watch();
   await crons.load();
   crons.watch();
+  await taskStore.load();
+  await watcherStore.load();
   await sweepOldLogs(30);
   await busy.reset();
   keepalive.start();
@@ -120,6 +127,42 @@ async function main(): Promise<void> {
     }
   }
 
+  // Background tasks don't survive a restart (they're in-process), but their
+  // Claude sessionIds do. Mark the orphans and offer each chat a Resume button
+  // rather than silently dropping work the user is waiting on.
+  taskRunner.init(config);
+  taskRunner.startSweeper();
+  const interrupted = await taskStore.markInterruptedOnBoot();
+  for (const task of interrupted) {
+    const notify =
+      task.transport === "telegram"
+        ? tg.notifyChat
+        : slack
+          ? slack.notifyChat
+          : undefined;
+    if (!notify) continue;
+    const io = ioFor(task.transport, task.chatId, task.chatKind);
+    const text =
+      `🔌 Task \`${task.id}\` was interrupted by a restart` +
+      `${task.sessionId ? " — its session is intact, so it can pick up where it left off." : "."}` +
+      (task.worktree ? `\nBranch \`${task.worktree.branch}\` is still there.` : "");
+    if (io && task.sessionId) {
+      await io
+        .reply(text, {
+          parseMode: "markdown",
+          buttons: [
+            [
+              { label: "▶️ Resume", callbackId: `task:allow:${task.id}` },
+              { label: "🗑 Discard", callbackId: `task:discard:${task.id}` },
+            ],
+          ],
+        })
+        .catch(() => {});
+    } else {
+      await notify(task.chatId, text).catch(() => {});
+    }
+  }
+
   const marker = await restartMarker.consume().catch(() => null);
   if (marker && marker.chats.length > 0) {
     const elapsedMs = Date.now() - marker.shutdownAt;
@@ -142,11 +185,22 @@ async function main(): Promise<void> {
     shuttingDown = true;
     const shutdownStart = Date.now();
 
-    // Stop the scheduler first so no new cron fires during the drain window.
+    // Stop the schedulers first so no new cron/watcher fires during the drain.
     cronTicker.stop();
+    watcherTicker.stop();
     users.stopWatch();
     crons.stopWatch();
     engine.beginShutdown();
+    // Background tasks are deliberately NOT part of the drain: they can run for
+    // an hour and would block every reload. They're aborted here and reconciled
+    // on the next boot from their persisted sessionIds.
+    taskRunner.stopSweeper();
+    const abortedTasks = taskRunner.beginShutdown(sig);
+    if (abortedTasks > 0) {
+      console.log(
+        `[shutdown] aborted ${abortedTasks} background task(s) — they'll be offered a Resume on next boot`,
+      );
+    }
 
     const inFlight = engine.inFlightChats();
     const last = engine.lastActiveChat();
@@ -254,6 +308,7 @@ async function main(): Promise<void> {
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
   cronTicker.start();
+  watcherTicker.start();
   await tg.start();
   if (slack) {
     await slack.start();

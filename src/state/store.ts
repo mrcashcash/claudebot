@@ -12,11 +12,49 @@ import { log, logError } from "./logger.ts";
  * groups so each Telegram group has its own settings independent of the
  * user's other chats).
  */
+/**
+ * One trust rule. `tool` is an exact tool name; `arg` is an optional glob
+ * matched against a per-tool canonical string (the command for Bash, the
+ * workspace-relative path for Write/Edit/Read, …) — see
+ * `handlers/trustPolicy.ts`, which owns the matching semantics. A rule with no
+ * `arg` matches any input, which is exactly what the legacy
+ * `allowAlwaysTools` / `denyAlwaysTools` entries meant.
+ */
+export interface TrustRule {
+  id: string;
+  effect: "allow" | "deny";
+  tool: string;
+  arg?: string;
+  createdAt: number;
+}
+
+/**
+ * A time-boxed "stop asking me" grant. Expiry is wall-clock and checked at
+ * evaluation time, never cached for the duration of a turn.
+ */
+export interface TrustGrant {
+  untilMs: number;
+  /** "chat" applies to every turn in the chat; "task" only to one task id. */
+  scope: "chat" | "task";
+  taskId?: string;
+  createdAt: number;
+}
+
 export interface ChatState {
   sessionId?: string;
   totalCostUsd?: number;
   allowAlwaysTools?: string[];
   denyAlwaysTools?: string[];
+  /** Pattern rules — supersede allowAlwaysTools/denyAlwaysTools. */
+  trustRules?: TrustRule[];
+  grants?: TrustGrant[];
+  /** Month bucket for budget enforcement: "2026-08" in the user's tz. */
+  monthKey?: string;
+  monthUsd?: number;
+  /** Highest warning threshold already announced this month (e.g. 80). */
+  budgetWarnedPct?: number;
+  /** Per-chat monthly cap, overriding the user's `budget.monthlyUsd`. */
+  budgetUsd?: number;
   workspaceDir?: string;
   permissionMode?: PermissionMode;
   model?: string;
@@ -33,6 +71,36 @@ export interface ChatState {
    * user message.
    */
   lastPrompt?: string;
+}
+
+/**
+ * The chat's effective rule list: explicit `trustRules` first, then the legacy
+ * `allowAlwaysTools` / `denyAlwaysTools` entries folded in as bare-tool rules.
+ * Read-time and non-destructive — nothing is rewritten on disk until the next
+ * rule write (see `sessions.addTrustRule`), so a rollback keeps working.
+ *
+ * Lives here rather than in handlers/trustPolicy.ts so both the state layer
+ * (which migrates on write) and the policy layer (which matches on read) share
+ * one implementation without the state layer importing from handlers.
+ */
+export function deriveTrustRules(state: ChatState): TrustRule[] {
+  const out: TrustRule[] = [...(state.trustRules ?? [])];
+  const seen = new Set(
+    out.map((r) => `${r.effect}:${r.tool}${r.arg ? `(${r.arg})` : ""}`),
+  );
+  const legacy: [string[] | undefined, "allow" | "deny"][] = [
+    [state.denyAlwaysTools, "deny"],
+    [state.allowAlwaysTools, "allow"],
+  ];
+  for (const [list, effect] of legacy) {
+    for (const tool of list ?? []) {
+      const key = `${effect}:${tool}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ id: `legacy-${effect}-${tool}`, effect, tool, createdAt: 0 });
+    }
+  }
+  return out;
 }
 
 export interface AppConfig {

@@ -3,6 +3,8 @@ import type {
   PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import * as sessions from "../state/sessions.ts";
+import { SESSIONS_READONLY_TOOLS } from "../services/sessionsMcp.ts";
+import * as trust from "./trustPolicy.ts";
 import * as approvals from "./approvals.ts";
 import * as questions from "./questions.ts";
 import type { ButtonGrid, TurnIO } from "./turnIO.ts";
@@ -18,7 +20,12 @@ function inputSummary(input: Record<string, unknown>): string {
 
 const PROMPT_MAX = 3500;
 
-export type TriggerSource = "user" | "cron";
+/**
+ * Who started the turn. Governs what happens when a tool isn't pre-approved:
+ * "user" prompts, "cron" auto-denies (nobody is awake), "task" escalates via
+ * `CanUseToolOptions.onEscalate` so the task can pause and resume later.
+ */
+export type TriggerSource = "user" | "cron" | "task";
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -79,8 +86,11 @@ function formatToolPrompt(
   return truncate(lines.join("\n"), PROMPT_MAX);
 }
 
-function permissionButtons(toolUseId: string): ButtonGrid {
-  return [
+function permissionButtons(
+  toolUseId: string,
+  proposed: string | undefined,
+): ButtonGrid {
+  const grid: ButtonGrid = [
     [
       { label: "✅ Allow", callbackId: `perm:allow:once:${toolUseId}` },
       { label: "✅ Always", callbackId: `perm:allow:always:${toolUseId}` },
@@ -90,11 +100,17 @@ function permissionButtons(toolUseId: string): ButtonGrid {
       { label: "❌ Never", callbackId: `perm:deny:always:${toolUseId}` },
     ],
   ];
-}
-
-function ruleMatches(toolName: string, rules: string[] | undefined): boolean {
-  if (!rules || rules.length === 0) return false;
-  return rules.includes(toolName);
+  // The scoped row only appears when there's a meaningful narrowing to offer,
+  // so "Always" keeps its old meaning and the choice stays explicit.
+  if (proposed) {
+    grid.splice(1, 0, [
+      {
+        label: `✅ Always ${proposed}`.slice(0, 60),
+        callbackId: `perm:allow:pattern:${toolUseId}`,
+      },
+    ]);
+  }
+  return grid;
 }
 
 function isAskUserQuestionInput(
@@ -115,11 +131,29 @@ function isAskUserQuestionInput(
   return true;
 }
 
+export interface CanUseToolOptions {
+  /** Resolves path-scoped rules like `Write(src/**)`. */
+  workspaceDir?: string;
+  /** Set on background-task turns so task-scoped grants apply. */
+  taskId?: string;
+  /**
+   * Called instead of prompting when the verdict is "prompt" on a task turn.
+   * Returning a PermissionResult lets the task pause itself (Stage 3) rather
+   * than hanging on a button nobody is watching.
+   */
+  onEscalate?: (
+    toolName: string,
+    input: Record<string, unknown>,
+    toolUseId: string,
+  ) => Promise<PermissionResult>;
+}
+
 export function buildCanUseTool(
   io: TurnIO,
   chatId: string,
   turnSignal: AbortSignal,
   triggerSource: TriggerSource = "user",
+  opts: CanUseToolOptions = {},
 ): CanUseTool {
   return async (toolName, input, options): Promise<PermissionResult> => {
     const toolUseId = options.toolUseID;
@@ -139,21 +173,41 @@ export function buildCanUseTool(
       return { behavior: "allow", updatedInput: input };
     }
 
+    // Auto-allow the read-only cross-session tools — they only stat/read
+    // transcripts under ~/.claude/projects for the current workspace. The
+    // paid one (`session_ask`, which forks a session and runs a sub-agent)
+    // deliberately falls through to the normal approval path.
+    if (SESSIONS_READONLY_TOOLS.has(toolName)) {
+      void log({
+        category: "approval",
+        event: "approval.auto_allow",
+        chatId,
+        tool: toolName,
+        toolUseId,
+        reason: "sessions_readonly",
+      });
+      return { behavior: "allow", updatedInput: input };
+    }
+
     if (toolName === "AskUserQuestion") {
-      // Cron-fired turns have no human reader to answer questions.
-      if (triggerSource === "cron") {
+      // Cron fires have no reader; background tasks have one who isn't
+      // watching. Either way, blocking on a dialogue turn is the wrong shape —
+      // the work should proceed on a stated assumption instead.
+      if (triggerSource === "cron" || triggerSource === "task") {
         void log({
           category: "approval",
           event: "approval.auto_deny",
           chatId,
           tool: toolName,
           toolUseId,
-          reason: "cron_no_human",
+          reason: triggerSource === "cron" ? "cron_no_human" : "task_no_human",
         });
         return {
           behavior: "deny",
           message:
-            "Cron-fired turns cannot ask the user questions. Phrase the prompt with all the info needed up front, or schedule a different prompt.",
+            triggerSource === "cron"
+              ? "Cron-fired turns cannot ask the user questions. Phrase the prompt with all the info needed up front, or schedule a different prompt."
+              : "Background tasks cannot ask questions — nobody is reading along. Pick the most reasonable interpretation, state the assumption in your final summary, and continue.",
         };
       }
       if (!isAskUserQuestionInput(input)) {
@@ -217,32 +271,55 @@ export function buildCanUseTool(
     }
 
     const state = sessions.get(chatId);
-    if (ruleMatches(toolName, state.denyAlwaysTools)) {
+    const decision = trust.evaluate({
+      toolName,
+      input,
+      rules: sessions.trustRulesFor(chatId),
+      ...(state.grants ? { grants: state.grants } : {}),
+      ...(opts.workspaceDir ? { workspaceDir: opts.workspaceDir } : {}),
+      ...(opts.taskId ? { taskId: opts.taskId } : {}),
+    });
+    if (decision.verdict === "deny") {
       void log({
         category: "approval",
         event: "approval.auto_deny",
         chatId,
         tool: toolName,
         toolUseId,
-        reason: "always_deny",
+        reason: decision.reason,
         inputSummary: inputSummary(input),
       });
       return {
         behavior: "deny",
-        message: `User has set ${toolName} to always-deny in this chat.`,
+        message: `Blocked by a trust rule in this chat (${decision.reason}). Use /trust to change it.`,
       };
     }
-    if (ruleMatches(toolName, state.allowAlwaysTools)) {
+    if (decision.verdict === "allow") {
       void log({
         category: "approval",
         event: "approval.auto_allow",
         chatId,
         tool: toolName,
         toolUseId,
-        reason: "always_allow",
+        reason: decision.reason,
         inputSummary: inputSummary(input),
       });
       return { behavior: "allow", updatedInput: input };
+    }
+
+    // Background tasks escalate instead of blocking: the task pauses, frees its
+    // slot, and resumes when the user taps Allow (see core/taskRunner.ts).
+    if (opts.onEscalate) {
+      void log({
+        category: "approval",
+        event: "approval.escalated",
+        chatId,
+        tool: toolName,
+        toolUseId,
+        taskId: opts.taskId,
+        inputSummary: inputSummary(input),
+      });
+      return await opts.onEscalate(toolName, input, toolUseId);
     }
 
     // Cron-fired turns must not block waiting for inline-button approval —
@@ -265,8 +342,11 @@ export function buildCanUseTool(
       };
     }
 
-    const text = formatToolPrompt(toolName, input);
-    const buttons = permissionButtons(toolUseId);
+    const proposed = trust.proposePattern(toolName, input, opts.workspaceDir);
+    const text =
+      formatToolPrompt(toolName, input) +
+      (proposed ? `\n\n_"Always ${proposed}" scopes the rule instead of trusting every ${toolName} call._` : "");
+    const buttons = permissionButtons(toolUseId, proposed);
     let promptMessageId: string | undefined;
     try {
       const sent = await io.reply(text, { parseMode: "markdown", buttons });
@@ -298,7 +378,9 @@ export function buildCanUseTool(
     return await new Promise<PermissionResult>((resolve) => {
       approvals.register(toolUseId, async (choice) => {
         if (choice.scope === "always") {
-          await sessions.addAlwaysRule(chatId, choice.decision, toolName);
+          await sessions.addTrustRule(chatId, choice.decision, toolName);
+        } else if (choice.scope === "pattern" && proposed) {
+          await sessions.addTrustRule(chatId, choice.decision, toolName, proposed);
         }
         if (choice.decision === "allow") {
           resolve({ behavior: "allow", updatedInput: input });
@@ -347,7 +429,7 @@ export interface PermissionVerdict {
  * dance with the returned verdict.
  */
 export function applyPermissionCallback(data: string): PermissionVerdict | null {
-  const permMatch = data.match(/^perm:(allow|deny):(once|always):(.+)$/);
+  const permMatch = data.match(/^perm:(allow|deny):(once|always|pattern):(.+)$/);
   if (!permMatch) return null;
 
   const decision = permMatch[1] as approvals.Decision;
@@ -355,22 +437,22 @@ export function applyPermissionCallback(data: string): PermissionVerdict | null 
   const toolUseId = permMatch[3]!;
   const settled = approvals.settle(toolUseId, { decision, scope });
 
-  const toastLabel =
-    decision === "allow"
-      ? scope === "always"
-        ? "Allowed (always)"
-        : "Allowed"
-      : scope === "always"
-        ? "Denied (always)"
-        : "Denied";
-  const resolutionSuffix =
-    decision === "allow"
-      ? scope === "always"
-        ? "\n\n✅ *Allowed* (always for this chat)"
-        : "\n\n✅ *Allowed*"
-      : scope === "always"
-        ? "\n\n❌ *Denied* (always for this chat)"
-        : "\n\n❌ *Denied*";
+  const verb = decision === "allow" ? "Allowed" : "Denied";
+  const scopeNote =
+    scope === "always"
+      ? " (always)"
+      : scope === "pattern"
+        ? " (scoped rule)"
+        : "";
+  const toastLabel = `${verb}${scopeNote}`;
+  const icon = decision === "allow" ? "✅" : "❌";
+  const suffixScope =
+    scope === "always"
+      ? " (always for this chat)"
+      : scope === "pattern"
+        ? " (scoped rule added — see /trust)"
+        : "";
+  const resolutionSuffix = `\n\n${icon} *${verb}*${suffixScope}`;
 
   return {
     decision,

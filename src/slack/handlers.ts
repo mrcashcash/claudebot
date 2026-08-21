@@ -4,6 +4,7 @@ import * as users from "../state/users.ts";
 import { seedDefaultCronsIfMissing } from "../state/seedDefaultCrons.ts";
 import { ioFromSlack } from "./io.ts";
 import { dispatchSlackCommand } from "./commands.ts";
+import { maybeSwitchSession } from "../handlers/sessionSwitch.ts";
 import { logError } from "../state/logger.ts";
 import type { TurnIO } from "../handlers/turnIO.ts";
 import type { KickOffOptions } from "../core/turnEngine.ts";
@@ -94,6 +95,14 @@ export function registerSlackEvents(app: App, deps: SlackEventDeps): void {
       if (handled) return;
     }
     if (text.trim().length === 0) return;
+    const switched = await maybeSwitchSession(
+      { io, chatId: channelId, userId, gatewayDir: config.gatewayDir },
+      text,
+    ).catch((err) => {
+      void logError("error.session_switch", err, { chatId: channelId, userId });
+      return false;
+    });
+    if (switched) return;
     kickOffTurn(io, channelId, userId, text, { recordAsLast: true });
   });
 
@@ -139,6 +148,14 @@ export function registerSlackEvents(app: App, deps: SlackEventDeps): void {
       await io.reply("Mention me with a question — e.g. `@claude what files are in this workspace?`");
       return;
     }
+    const switched = await maybeSwitchSession(
+      { io, chatId: channelId, userId, gatewayDir: config.gatewayDir },
+      stripped,
+    ).catch((err) => {
+      void logError("error.session_switch", err, { chatId: channelId, userId });
+      return false;
+    });
+    if (switched) return;
     kickOffTurn(io, channelId, userId, stripped, { recordAsLast: true });
   });
 }

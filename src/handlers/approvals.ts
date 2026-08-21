@@ -1,5 +1,12 @@
 export type Decision = "allow" | "deny";
-export type Scope = "once" | "always";
+/**
+ * "once"    — this call only.
+ * "always"  — bare-tool rule (any input), i.e. the historical meaning.
+ * "pattern" — scoped rule; the pattern is recomputed by the resolver from the
+ *             pending call's input rather than carried in the callback id,
+ *             which has to fit in Telegram's 64-byte callback_data.
+ */
+export type Scope = "once" | "always" | "pattern";
 
 export interface ApprovalChoice {
   decision: Decision;

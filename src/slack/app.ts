@@ -5,6 +5,7 @@ import { registerSlackActions } from "./actions.ts";
 import { registerSlackEvents } from "./handlers.ts";
 import { ioFromSlack } from "./io.ts";
 import { registerTransport, registerNotify } from "../scheduler/transport.ts";
+import { registerIoFactory } from "../core/ioRegistry.ts";
 import type { ChatKind } from "../handlers/turnIO.ts";
 import { logError } from "../state/logger.ts";
 
@@ -64,6 +65,12 @@ export async function buildSlackApp(
     }
   };
   registerNotify("slack", notifyChat);
+
+  // Durable IO for background tasks (core/taskRunner.ts), which report back
+  // after the event handler that started them has returned.
+  registerIoFactory("slack", (chatId, chatKind) =>
+    ioFromSlack(app.client, chatId, chatKind),
+  );
 
   registerSlackEvents(app, {
     config,

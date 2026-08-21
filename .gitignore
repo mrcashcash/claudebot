@@ -6,4 +6,5 @@ workspace/
 dist/
 *.log
 .uploads/
+.worktrees/
 ruvector.db

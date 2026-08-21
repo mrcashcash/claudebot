@@ -112,15 +112,34 @@ export const COMMAND_MENU = [
     command: "cancel",
     description: "Stop the current Claude turn (keeps session)",
   },
+  {
+    command: "bg",
+    description: "Run a task in the background (own worktree + budget)",
+  },
+  { command: "tasks", description: "List background tasks" },
+  { command: "task", description: "Show one background task in detail" },
+  { command: "kill", description: "Stop a background task" },
   { command: "cost", description: "Show cumulative cost for this chat" },
+  {
+    command: "budget",
+    description: "Spend ceilings: monthly cap and per-turn cap",
+  },
   { command: "redo", description: "Re-run your last message" },
   {
+    command: "trust",
+    description: "Tool trust rules and time-boxed grants",
+  },
+  {
     command: "rules",
-    description: "List always-allow / always-deny tool rules",
+    description: "Alias for /trust",
   },
   {
     command: "cron",
     description: "List / pause / resume / delete scheduled crons",
+  },
+  {
+    command: "watch",
+    description: "Fire a task when git/fs/http/log state changes",
   },
   {
     command: "voice",

@@ -6,6 +6,7 @@ import {
   type HookInput,
   type AsyncHookJSONOutput,
   type SDKUserMessage,
+  type SettingSource,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { PermissionMode } from "../config.ts";
 import * as turnLog from "../state/turnLog.ts";
@@ -63,6 +64,30 @@ export interface AskClaudeOptions {
    * a Telegram placeholder message as Claude streams.
    */
   onTextDelta?: (delta: string, full: string) => void;
+  /**
+   * With `resumeSessionId`, branch into a NEW session id instead of appending
+   * to the resumed one. Used by the session-peek tool so asking an old session
+   * a question never mutates that session's transcript.
+   */
+  forkSession?: boolean;
+  /**
+   * Restrict which built-in tools exist for this query (SDK `tools`). Anything
+   * not listed is removed from the model's context entirely.
+   */
+  tools?: string[];
+  /** Tools pre-approved without hitting `canUseTool` (SDK `allowedTools`). */
+  allowedTools?: string[];
+  /**
+   * Which on-disk settings files to load. Defaults to all three
+   * (`user` / `project` / `local`), matching the CLI. Sub-queries that must be
+   * gated purely by `canUseTool` pass a narrower list, since `permissions.allow`
+   * rules in a settings file silently pre-approve tools before the callback runs.
+   */
+  settingSources?: SettingSource[];
+  /** Hard ceiling on agentic round-trips. */
+  maxTurns?: number;
+  /** Hard ceiling on spend; the query stops once exceeded. */
+  maxBudgetUsd?: number;
 }
 
 export class AskClaudeAbortedError extends Error {
@@ -197,8 +222,15 @@ export async function askClaude(
   const options: Options = {
     cwd: opts.cwd,
     permissionMode: opts.permissionMode,
-    settingSources: ["user", "project", "local"],
+    settingSources: opts.settingSources ?? ["user", "project", "local"],
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
+    ...(opts.forkSession ? { forkSession: true } : {}),
+    ...(opts.tools ? { tools: opts.tools } : {}),
+    ...(opts.allowedTools ? { allowedTools: opts.allowedTools } : {}),
+    ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
+    ...(opts.maxBudgetUsd !== undefined
+      ? { maxBudgetUsd: opts.maxBudgetUsd }
+      : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
     ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),

@@ -3,6 +3,7 @@ import { callbackQuery } from "telegraf/filters";
 import {
   dispatchApprovalClick,
   dispatchQuestionClick,
+  dispatchTaskClick,
 } from "../handlers/clickRouter.ts";
 import { ioFromContext } from "./io.ts";
 
@@ -71,6 +72,12 @@ export function registerTelegramActions(bot: Telegraf): void {
     if (data.startsWith("perm:")) {
       const result = await dispatchApprovalClick(data, clickCtx);
       await safeAnswerCbQuery(ctx, result.verdict?.toastLabel);
+      return;
+    }
+
+    if (data.startsWith("task:")) {
+      const result = await dispatchTaskClick(data, clickCtx);
+      await safeAnswerCbQuery(ctx, result.toast);
       return;
     }
 

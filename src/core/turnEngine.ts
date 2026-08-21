@@ -24,6 +24,11 @@ import {
   buildSendFileMcp,
   buildSendFileSystemGuidance,
 } from "../services/sendFileMcp.ts";
+import {
+  buildSessionsMcp,
+  buildSessionsSystemGuidance,
+} from "../services/sessionsMcp.ts";
+import * as budget from "./budget.ts";
 import { log, logError } from "../state/logger.ts";
 
 const CHUNK_SIZE = 3500;
@@ -251,11 +256,46 @@ export function buildTurnEngine(config: Config): TurnEngine {
       return;
     }
 
+    // Budget gate. Checked here rather than at enqueue time so a turn that
+    // waited behind others is judged against current spend.
+    const verdict = budget.check(chatId, userId);
+    if (!verdict.ok) {
+      void log({
+        category: "turn",
+        event: "turn.budget_blocked",
+        chatId,
+        userId,
+        spentUsd: verdict.status.spentUsd,
+        capUsd: verdict.status.capUsd,
+        source: triggerSource,
+      });
+      console.warn(
+        `[turn] chat=${chatId} blocked by monthly budget ($${verdict.status.spentUsd.toFixed(2)}/$${verdict.status.capUsd?.toFixed(2)})`,
+      );
+      try {
+        await io.reply(verdict.message!, { parseMode: "markdown" });
+      } catch {
+        // ignore — nothing else to do if we can't even report it
+      }
+      return;
+    }
+
     const controller = new AbortController();
     turnControllers.set(chatId, controller);
 
     const stopTyping = startTypingLoop(io);
-    const canUseTool = buildCanUseTool(io, chatId, controller.signal, triggerSource);
+    const workspaceDir = users.effectiveWorkspace(
+      chatId,
+      userId,
+      config.gatewayDir,
+    );
+    const canUseTool = buildCanUseTool(
+      io,
+      chatId,
+      controller.signal,
+      triggerSource,
+      { workspaceDir },
+    );
     const stream = createStreamingReply(io);
     inFlightChatsSet.add(chatId);
     void busy.acquire();
@@ -278,7 +318,7 @@ export function buildTurnEngine(config: Config): TurnEngine {
     console.log(
       `[turn] start chat=${chatId} user=${userId} session=${sessionTag} model=${modelTag} mode=${modeTag}${attachTag}${triggerTag} prompt="${promptPreview}${prompt.length > 80 ? "…" : ""}"`,
     );
-    const cwd = users.effectiveWorkspace(chatId, userId, config.gatewayDir);
+    const cwd = workspaceDir;
     void log({
       category: "turn",
       event: "turn.start",
@@ -298,6 +338,13 @@ export function buildTurnEngine(config: Config): TurnEngine {
       const tz = users.tzFor(userId);
       const schedulerServer = buildSchedulerMcp(chatId, userId, tz, io.transport);
       const sendFileServer = buildSendFileMcp(io, cwd);
+      const sessionsServer = buildSessionsMcp({
+        chatId,
+        workspaceDir: cwd,
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+        signal: controller.signal,
+        ...(resumeSessionId ? { currentSessionId: resumeSessionId } : {}),
+      });
       const additionalDirectories =
         cwd === config.gatewayDir ? undefined : [config.gatewayDir];
       const baseAsk = {
@@ -307,7 +354,14 @@ export function buildTurnEngine(config: Config): TurnEngine {
         canUseTool,
         chatId,
         signal: controller.signal,
-        mcpServers: { scheduler: schedulerServer, claudebot: sendFileServer },
+        ...(verdict.turnCapUsd !== undefined
+          ? { maxBudgetUsd: verdict.turnCapUsd }
+          : {}),
+        mcpServers: {
+          scheduler: schedulerServer,
+          claudebot: sendFileServer,
+          sessions: sessionsServer,
+        },
         appendSystemPrompt:
           buildSchedulerSystemGuidance(
             tz,
@@ -316,7 +370,9 @@ export function buildTurnEngine(config: Config): TurnEngine {
             io.chatKind === "group",
           ) +
           "\n\n" +
-          buildSendFileSystemGuidance(io.transport),
+          buildSendFileSystemGuidance(io.transport) +
+          "\n\n" +
+          buildSessionsSystemGuidance(),
         ...(additionalDirectories ? { additionalDirectories } : {}),
         onTextDelta: (_delta: string, full: string) => stream.push(full),
         onSessionId: async (sid: string) => {
@@ -379,6 +435,8 @@ export function buildTurnEngine(config: Config): TurnEngine {
         });
       }
 
+      const spend = await budget.recordSpend(chatId, userId, reply.costUsd);
+
       const body =
         reply.text.length > 0
           ? reply.text
@@ -395,6 +453,13 @@ export function buildTurnEngine(config: Config): TurnEngine {
           text: reply.text,
           inputWasVoice: opts.inputWasVoice === true,
         });
+      }
+      if (spend.warning) {
+        try {
+          await io.reply(spend.warning, { parseMode: "markdown" });
+        } catch {
+          // non-fatal — the turn itself already landed
+        }
       }
       const totalMs = Date.now() - turnStart;
       const traceTail =

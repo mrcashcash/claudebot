@@ -10,6 +10,8 @@ import { registerMediaHandlers } from "./mediaHandlers.ts";
 import { registerTelegramActions } from "./actions.ts";
 import { shouldRespond } from "./respondGate.ts";
 import { buildReplyContext } from "./replyContext.ts";
+import { maybeSwitchSession } from "../handlers/sessionSwitch.ts";
+import { registerIoFactory } from "../core/ioRegistry.ts";
 import type { TurnEngine, KickOffOptions } from "../core/turnEngine.ts";
 import type { TriggerSource } from "../handlers/toolApprovals.ts";
 import { logError } from "../state/logger.ts";
@@ -120,6 +122,14 @@ export function buildTelegramApp(
     });
   }
 
+  // Durable IO for background tasks, which outlive the handler that started
+  // them and so can't hold a ctx-derived io.
+  registerIoFactory("telegram", (chatId, chatKind) => {
+    const numericId = Number(chatId);
+    if (!Number.isFinite(numericId)) return undefined;
+    return ioFromTelegram(bot.telegram, numericId, chatKind);
+  });
+
   registerCommands(bot, {
     config,
     bootTime,
@@ -134,6 +144,18 @@ export function buildTelegramApp(
     const text = ctx.message.text;
     if (text.startsWith("/")) return;
     if (!shouldRespond(ctx)) return;
+    const userId = ctx.from?.id;
+    // A message that is nothing but a session id means "hop to that session".
+    if (userId !== undefined) {
+      const switched = await maybeSwitchSession(
+        { io: ioFromContext(ctx), chatId, userId, gatewayDir: config.gatewayDir },
+        text,
+      ).catch((err) => {
+        void logError("error.session_switch", err, { chatId, userId });
+        return false;
+      });
+      if (switched) return;
+    }
     const prompt = buildReplyContext(ctx.message.reply_to_message) + text;
     kickOffTurnFromContext(ctx, chatId, prompt, { recordAsLast: true });
   });

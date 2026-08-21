@@ -2,6 +2,7 @@ import type { App } from "@slack/bolt";
 import {
   dispatchApprovalClick,
   dispatchQuestionClick,
+  dispatchTaskClick,
 } from "../handlers/clickRouter.ts";
 import { ioFromSlack } from "./io.ts";
 
@@ -14,7 +15,7 @@ import { ioFromSlack } from "./io.ts";
 export function registerSlackActions(app: App): void {
   // The action_id we set on the buttons IS the callback id, so the regex
   // matches every payload we send and lets us route by prefix below.
-  app.action(/^(?:perm|q):/, async ({ ack, body, action, client }) => {
+  app.action(/^(?:perm|q|task):/, async ({ ack, body, action, client }) => {
     await ack();
     const a = action as { value?: string; action_id?: string };
     const data = (a.value ?? a.action_id ?? "") as string;
@@ -50,6 +51,10 @@ export function registerSlackActions(app: App): void {
     }
     if (data.startsWith("perm:")) {
       await dispatchApprovalClick(data, clickCtx);
+      return;
+    }
+    if (data.startsWith("task:")) {
+      await dispatchTaskClick(data, clickCtx);
       return;
     }
   });
