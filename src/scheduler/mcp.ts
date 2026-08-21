@@ -8,6 +8,13 @@ import { log } from "../state/logger.ts";
 export const MAX_CRONS_PER_CHAT = 20;
 
 /**
+ * Prompt budget for the all-crons listing. Single-cron lookups and the
+ * create/update echoes are never truncated — a truncated prompt cannot be
+ * edited faithfully.
+ */
+const PROMPT_PREVIEW_CHARS = 400;
+
+/**
  * Build the per-turn scheduler system prompt addendum. The TZ varies per user
  * (each user's app config can override it), so the guidance is composed when
  * the turn starts rather than baked into a module-level constant.
@@ -58,7 +65,11 @@ function validateCron(
   }
 }
 
-function describeCron(c: crons.Cron, tz: string): string {
+function describeCron(
+  c: crons.Cron,
+  tz: string,
+  opts: { fullPrompt?: boolean } = {},
+): string {
   let nextStr = "n/a";
   try {
     const it = CronExpressionParser.parse(c.cron, { tz });
@@ -70,6 +81,10 @@ function describeCron(c: crons.Cron, tz: string): string {
     c.lastFiredAt !== undefined
       ? new Date(c.lastFiredAt).toISOString()
       : "never";
+  const truncated = !opts.fullPrompt && c.prompt.length > PROMPT_PREVIEW_CHARS;
+  const promptOut = truncated
+    ? c.prompt.slice(0, PROMPT_PREVIEW_CHARS) + "…"
+    : c.prompt;
   return [
     `id=${c.id}`,
     `cron="${c.cron}" (${tz})`,
@@ -78,8 +93,9 @@ function describeCron(c: crons.Cron, tz: string): string {
     `enabled=${c.enabled}`,
     `resume=${c.resume}`,
     c.oneShot ? `oneShot=true` : null,
+    c.systemTask ? `systemTask=${c.systemTask}` : null,
     c.description ? `desc="${c.description}"` : null,
-    `prompt=${JSON.stringify(c.prompt.length > 200 ? c.prompt.slice(0, 200) + "…" : c.prompt)}`,
+    `prompt=${JSON.stringify(promptOut)}${truncated ? ` (truncated from ${c.prompt.length} chars — call cron_list with id="${c.id}" for the full text)` : ""}`,
   ]
     .filter(Boolean)
     .join(" ");
@@ -165,15 +181,29 @@ export function buildSchedulerMcp(
             description,
           });
           return ok(
-            `✅ Created cron ${created.id}\n${describeCron(created, tz)}`,
+            `✅ Created cron ${created.id}\n${describeCron(created, tz, { fullPrompt: true })}`,
           );
         },
       ),
       tool(
         "cron_list",
-        "List all scheduled crons for THIS chat. Output is a plain-text summary with id, cron expression, next fire time, last fire time, enabled flag, and prompt preview.",
-        {},
-        async () => {
+        `List the scheduled crons for THIS chat: id, cron expression, next fire time, last fire time, enabled flag, and prompt. Prompts longer than ${PROMPT_PREVIEW_CHARS} characters are truncated in the all-crons listing — pass \`id\` to get one cron with its prompt in full, which you must do before rewriting a prompt via cron_update so you are editing the real text and not a preview.`,
+        {
+          id: z
+            .string()
+            .optional()
+            .describe(
+              "Show only this cron, with its full untruncated prompt. Omit to list every cron in the chat.",
+            ),
+        },
+        async ({ id }) => {
+          if (id !== undefined) {
+            const one = crons.get(id);
+            if (!one || one.chatId !== chatId) {
+              return err(`No cron with id ${id} in this chat`);
+            }
+            return ok(describeCron(one, tz, { fullPrompt: true }));
+          }
           const list = crons.list(chatId);
           if (list.length === 0) {
             return ok("(no crons scheduled in this chat)");
@@ -182,6 +212,125 @@ export function buildSchedulerMcp(
             .sort((a, b) => a.createdAt - b.createdAt)
             .map((c) => describeCron(c, tz));
           return ok(`${list.length} cron(s):\n` + lines.join("\n"));
+        },
+      ),
+      tool(
+        "cron_update",
+        `Edit an existing cron of THIS chat in place — its schedule, prompt, resume flag, oneShot flag, description, or enabled/paused state. Pass only the fields you want to change; the rest are left alone and the cron keeps its id. Prefer this over cron_delete + cron_create: recreating mints a new id the user no longer recognises and forces you to restate the whole prompt from a truncated listing. When rewriting a prompt, read it first with cron_list \`id\`. Changing the schedule re-baselines the job to now, so a slot that already passed is not fired retroactively.`,
+        {
+          id: z.string().describe("The cron id, as shown by cron_list"),
+          cron: z
+            .string()
+            .optional()
+            .describe(
+              "New 5-field cron expression, e.g. '*/5 * * * *' for every 5 minutes. Omit to keep the current schedule.",
+            ),
+          prompt: z
+            .string()
+            .min(1)
+            .optional()
+            .describe(
+              "Replacement prompt. This overwrites the old one rather than appending, so pass the complete text. Omit to keep the current prompt.",
+            ),
+          resume: z
+            .boolean()
+            .optional()
+            .describe(
+              "Whether each fire continues this chat's Claude session (true) or starts fresh (false). Omit to keep the current setting.",
+            ),
+          oneShot: z
+            .boolean()
+            .optional()
+            .describe(
+              "Whether the cron auto-deletes after its next fire. Omit to keep the current setting.",
+            ),
+          description: z
+            .string()
+            .optional()
+            .describe(
+              "New human-readable label shown by /cron list. Omit to keep the current one.",
+            ),
+          enabled: z
+            .boolean()
+            .optional()
+            .describe(
+              "false pauses the cron — the row is kept but never fires; true resumes it. Omit to keep the current state.",
+            ),
+        },
+        async ({ id, cron, prompt, resume, oneShot, description, enabled }) => {
+          const existing = crons.get(id);
+          if (!existing) return err(`No cron with id ${id}`);
+          if (existing.chatId !== chatId) {
+            return err(
+              `Cron ${id} does not belong to this chat; refusing to update.`,
+            );
+          }
+          if (cron !== undefined) {
+            const v = validateCron(cron, tz);
+            if (!v.ok) return err(`Invalid cron expression: ${v.reason}`);
+          }
+          // System-task crons run an in-process handler, not a Claude turn, so
+          // `prompt`/`resume` are dead fields on them — and `description` is the
+          // marker `seedDefaultCronsIfMissing` matches on, so renaming it would
+          // make the seeder create a duplicate. Schedule and enabled only.
+          if (
+            existing.systemTask &&
+            (prompt !== undefined ||
+              resume !== undefined ||
+              oneShot !== undefined ||
+              description !== undefined)
+          ) {
+            return err(
+              `Cron ${id} runs the built-in "${existing.systemTask}" system task rather than a prompt. Only \`cron\` and \`enabled\` are editable on it.`,
+            );
+          }
+          const patch: Partial<Omit<crons.Cron, "id" | "createdAt">> = {
+            ...(cron !== undefined ? { cron } : {}),
+            ...(prompt !== undefined ? { prompt } : {}),
+            ...(resume !== undefined ? { resume } : {}),
+            ...(oneShot !== undefined ? { oneShot } : {}),
+            ...(description !== undefined ? { description } : {}),
+            ...(enabled !== undefined ? { enabled } : {}),
+          };
+          if (Object.keys(patch).length === 0) {
+            return err(
+              "Nothing to update — pass at least one of cron, prompt, resume, oneShot, description, enabled.",
+            );
+          }
+          if (cron !== undefined) {
+            // `createdAt` stays put on an update, so the ticker's "ignore slots
+            // older than createdAt" guard no longer shields the *new*
+            // expression's most recent past slot: switching a daily job to
+            // '*/5 * * * *' at 14:52 would instantly fire the 14:50 slot,
+            // prefixed with a bogus "ran 2m late — bot was offline". Pinning
+            // lastFiredAt just under the current minute reproduces what
+            // cron_create gets — past slots suppressed, current minute still
+            // eligible.
+            const now = Date.now();
+            patch.lastFiredAt = now - (now % 60_000) - 1;
+          }
+          await crons.update(id, patch);
+          // Re-read so the echo reflects the merged row; fall back to the
+          // local merge in case the watcher reloaded the file mid-await.
+          const updated = crons.get(id) ?? { ...existing, ...patch };
+          void log({
+            category: "cron",
+            event: "cron.updated",
+            chatId,
+            userId,
+            cronId: id,
+            transport: existing.transport,
+            changed: Object.keys(patch).filter((k) => k !== "lastFiredAt"),
+            ...(cron !== undefined ? { cron } : {}),
+            ...(prompt !== undefined ? { prompt } : {}),
+            ...(resume !== undefined ? { resume } : {}),
+            ...(oneShot !== undefined ? { oneShot } : {}),
+            ...(description !== undefined ? { description } : {}),
+            ...(enabled !== undefined ? { enabled } : {}),
+          });
+          return ok(
+            `✅ Updated cron ${id}\n${describeCron(updated, tz, { fullPrompt: true })}`,
+          );
         },
       ),
       tool(

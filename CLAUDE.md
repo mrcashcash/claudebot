@@ -84,7 +84,7 @@ Module map (everything lives in `src/`). The codebase splits cleanly into **core
 
 **`scheduler/`**
 
-- `scheduler/mcp.ts` — `buildSchedulerMcp(chatId, userId, tz, transport)` returns the per-turn SDK MCP server exposing `cron_create` / `cron_list` / `cron_delete` (closed over the current chat + transport so a Slack cron records `transport: "slack"` and fires back to Slack). `buildSchedulerSystemGuidance(tz, userId, chatId, isGroup)` is the per-turn system-prompt addendum.
+- `scheduler/mcp.ts` — `buildSchedulerMcp(chatId, userId, tz, transport)` returns the per-turn SDK MCP server exposing `cron_create` / `cron_list` / `cron_update` / `cron_delete` (closed over the current chat + transport so a Slack cron records `transport: "slack"` and fires back to Slack). `buildSchedulerSystemGuidance(tz, userId, chatId, isGroup)` is the per-turn system-prompt addendum.
 - `scheduler/transport.ts` — small `Transport → kickOffTurnFromCron` registry. `index.ts` registers `"telegram"` (from `telegram/app.ts`) and `slack/app.ts` registers `"slack"` itself.
 - `scheduler/runner.ts` — `fire(c, lateMs)` builds the prompt and dispatches via the registry.
 - `scheduler/ticker.ts` — single `setInterval(60s)` that finds due jobs via `cron-parser` (TZ resolved per row), reserves the slot via `lastFiredAt`, then fires. Catch-up window 30 minutes.
@@ -117,8 +117,9 @@ Note: external edits to `data/config.json` (whether from Claude in a turn or a h
 
 ### Scheduler (cron jobs)
 
-Claude can schedule recurring prompts via the per-turn `mcp__scheduler__cron_create` / `cron_list` / `cron_delete` tools. State lives in `data/crons.json`; the ticker (`scheduler/ticker.ts`) polls every 60s.
+Claude can schedule recurring prompts via the per-turn `mcp__scheduler__cron_create` / `cron_list` / `cron_update` / `cron_delete` tools. State lives in `data/crons.json`; the ticker (`scheduler/ticker.ts`) polls every 60s.
 
+- **Edits go through `cron_update`, not delete-and-recreate.** `cron_update` patches any subset of `cron` / `prompt` / `resume` / `oneShot` / `description` / `enabled` on an existing id, so the job keeps the id the user knows and the prompt doesn't have to be restated. Two details it owns: (a) `cron_list` truncates prompts to `PROMPT_PREVIEW_CHARS` (400) in the all-crons listing, so `cron_list` takes an optional `id` that returns one row with the prompt in full — that's the read you need before rewriting a prompt; (b) changing the expression pins `lastFiredAt` to just under the current minute, because `createdAt` doesn't move on an update and the ticker's "ignore slots older than `createdAt`" guard would otherwise let the new expression's most recent past slot fire instantly with a bogus "ran N min late — bot was offline" prefix. `systemTask` rows (the seeded SDK-update cron) accept only `cron` and `enabled`: `prompt`/`resume` are dead fields there, and `description` is the marker `seedDefaultCronsIfMissing` matches on, so renaming it would make the seeder mint a duplicate.
 - **`mcp__scheduler__*` tools auto-allow.** `buildCanUseTool` short-circuits any tool whose name starts with `mcp__scheduler__` — no Allow/Deny prompt — because they only mutate `data/crons.json`. The actual prompt that fires later still goes through normal approvals.
 - **Cron-fired turns auto-deny non-allow-always tools.** `runTurn` is called with `triggerSource: "cron"`; `buildCanUseTool` rejects anything not in `state.allowAlwaysTools` instead of sending an inline-button approval that nobody is awake to click. To make a cron useful, send the prompt interactively first and tap **Always** on each tool the cron will need (or use `/rules`).
 - **Cron-fired turns also auto-deny `AskUserQuestion`** — there's no human reader. The prompt should already contain everything Claude needs.
